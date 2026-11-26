@@ -373,7 +373,8 @@
     //
     // 不猜“哪个键发出了字符”，而是记录 xterm 在键盘事件里实际发出的数据：
     // 只有 input 的数据与刚才键盘路径发出的不一致时，才清标记让 input 补发。
-    // term.onData 是所有发送的唯一出口，keydown/keypress/input 都会经过它。
+    // xterm 的 keydown/keypress/input 以及 229 keydown 额外安排的 textarea
+    // 差分发送都会经过 term.onData，可据此判断这个字符是否已经发过。
     const helperTextarea = term.textarea;
     if (helperTextarea && term._core) {
       let keyEventActive = false;
@@ -383,15 +384,24 @@
       let swallowInput = false;
       let lastBeforeInputData = null;
       let lastBeforeInputAt = 0;
+      let imeKeyDownAt = 0;
+      let pendingIME = null;
+      let lastSentData = null;
+      let lastSentAt = 0;
 
       term.onData((data) => {
+        lastSentData = data;
+        lastSentAt = performance.now();
         if (!keyEventActive) return;
         sentThisKeyEvent = true;
         lastKeySent = data;
-        lastKeySentAt = performance.now();
+        lastKeySentAt = lastSentAt;
       });
 
-      const beginKey = () => {
+      const beginKey = (event) => {
+        if (event.type === "keydown") {
+          imeKeyDownAt = event.keyCode === 229 ? performance.now() : 0;
+        }
         keyEventActive = true;
         sentThisKeyEvent = false;
       };
@@ -405,17 +415,47 @@
 
       const letInputThrough = (event) => {
         if (event.target !== helperTextarea) return;
-        if (!event.composed || !event.data) return;
+        if (!event.data) return;
         if (event.inputType !== "insertText" || event.isComposing) return;
 
         const now = performance.now();
+        const data = event.data;
 
         if (event.type === "beforeinput") {
-          lastBeforeInputData = event.data;
+          lastBeforeInputData = data;
           lastBeforeInputAt = now;
-        } else if (lastBeforeInputData === event.data && now - lastBeforeInputAt < 100) {
+        } else if (
+          pendingIME &&
+          pendingIME.data === data &&
+          now - pendingIME.at < 100
+        ) {
+          // beforeinput 已决定走 textarea 差分发送，这次 input 必须挡住：有些
+          // 设备（keyup 先于 input、input 非 composed）会让 xterm 的 _inputEvent
+          // 抢在差分之前再发一次，l 就变成 ll。兜底已在 beforeinput 里排好。
+          pendingIME = null;
+          term._core._keyDownSeen = true;
+          event.stopPropagation();
+          return;
+        } else if (lastBeforeInputData === data && now - lastBeforeInputAt < 100) {
           // 同一个数据已经由 beforeinput 处理过，input 只做兜底，不能重复决定。
           lastBeforeInputData = null;
+          return;
+        }
+
+        const imeAt = imeKeyDownAt;
+        if (imeAt && now - imeAt < 500) {
+          // 软键盘的 229 keydown 会让 xterm 在 keydown 里为 textarea 的后续变化
+          // 安排一次差分发送。吞掉这次 input，让差分成为唯一发送者；差分定时器
+          // 比这里先注册，它已经发过就不再补发。若 input 晚于差分触发、差分没
+          // 东西可发，由下面的兜底补发，保证字符不丢。
+          imeKeyDownAt = 0;
+          term._core._keyDownSeen = true;
+          event.stopPropagation();
+          if (event.type === "beforeinput") pendingIME = { data, at: now };
+          setTimeout(() => {
+            if (lastSentData === data && lastSentAt >= imeAt) return;
+            sendInput(pane, data);
+          }, 0);
           return;
         }
 

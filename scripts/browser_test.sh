@@ -58,6 +58,7 @@ run_test() {
 run_test ui
 run_test tabs
 run_test features
+run_test mobile_input
 run_test clipboard
 run_test session
 run_test files
