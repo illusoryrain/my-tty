@@ -36,4 +36,5 @@ cp package/lib/addon-fit.js package/LICENSE web/vendor/xterm/LICENSE.addon-fit
 **注意私有字段**：`web/app.js` 的输入法/移动端去重直接读写 xterm 内部的
 `term._core._keyDownSeen` 和 `term._core._keyDownHandled`。它们不是公开 API，升级后可能
 改名或语义变化而不报错。升级时务必跑 `scripts/browser_test.sh`：其中
-`tests/browser/features.cjs` 覆盖了 “input 补发字符” 和 “移动端重复输入（ls → llss）” 两条回归。
+`tests/browser/features.cjs` 覆盖了 “input 补发字符”、“移动端重复输入（ls → llss）”
+两条回归，以及 “keydown 已发字符时 keypress 不重发”（`_keyDownHandled`）。

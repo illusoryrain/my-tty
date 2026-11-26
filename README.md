@@ -182,7 +182,8 @@ HTTP API：`GET /api/fs/list|read|download`、`PUT /api/fs/write|upload`、
 `POST /api/fs/mkdir|rename`、`DELETE /api/fs/delete`。
 `read` 会返回内容哈希 `version`；`write` 带上 `base=<version>` 时，若文件在此期间
 被改动或删除则返回 `409 {"error":"modified_on_disk"}` 且不写入（编辑器据此提示是否覆盖），
-不带 `base` 时照常直接覆盖。
+不带 `base` 时照常直接覆盖。这是写入前的一次内容比对，不是原子 CAS；与外部程序
+同时写入时仍存在极短竞态。
 
 ## 分屏
 

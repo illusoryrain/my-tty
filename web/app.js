@@ -506,8 +506,10 @@
 
       termEl.addEventListener("keydown", beginKey, true);
       termEl.addEventListener("keypress", beginKey, true);
-      termEl.addEventListener("keydown", endKey);
-      termEl.addEventListener("keypress", endKey);
+      // endKey 必须挂在 textarea 本身且用捕获阶段：xterm 处理 Enter 等键时会
+      // stopPropagation()，挂在上层冒泡阶段收不到；同阶段的捕获监听仍会执行。
+      helperTextarea.addEventListener("keydown", endKey, true);
+      helperTextarea.addEventListener("keypress", endKey, true);
       // beforeinput 是最早的时机；input 捕获阶段始终保留兜底（在 xterm 自己的
       // textarea 监听器之前执行），并用 lastBeforeInputData 避免同一事件处理两次。
       if ("onbeforeinput" in helperTextarea) {
@@ -570,6 +572,9 @@
       retryAttempt: 0,
       retryable: true,
       opens: 0,
+      // connectPane 在等 ticket 时 pane.ws 还是空的；没有这个标记，online /
+      // visibilitychange 会在同一分屏上再取一张票，建出第二条 WebSocket。
+      connecting: false,
       // 终端输出写队列：xterm 还在解析上一批时到达的帧先攒起来，下一批合成一次 write。
       outQueue: [],
       outQueued: 0,
@@ -680,6 +685,10 @@
     if (current && (current.readyState === WebSocket.OPEN || current.readyState === WebSocket.CONNECTING)) {
       return;
     }
+    // 票据请求是异步的；这段窗口里 pane.ws 仍为空，必须靠标记挡住重入，
+    // 否则 online/可见性变化会为同一个分屏建出两条 WebSocket（甚至两个 PTY）。
+    if (pane.connecting) return;
+    pane.connecting = true;
     setPaneStatus(pane, "连接中…", "pending");
     pane.reconnect = () => connectPane(pane);
 
@@ -687,6 +696,7 @@
     try {
       const res = await fetch("/api/auth/ticket", { method: "POST", cache: "no-store" });
       if (!res.ok) {
+        pane.connecting = false;
         if (res.status === 401) {
           // 登录真的失效了：停止自动重连，登录成功后 startApp 会统一重试。
           pane.retryable = false;
@@ -701,13 +711,17 @@
       ticket = (await res.json()).ticket || "";
     } catch (err) {
       // 网络问题不等于登录失效：不弹登录框，安静退避重试。
+      pane.connecting = false;
       setPaneStatus(pane, "无法获取连接票据", "error");
       scheduleReconnect(pane);
       return;
     }
 
     // pane 可能在等待 ticket 时被关闭，或所在标签页被删掉。
-    if (!pane.el.isConnected) return;
+    if (!pane.el.isConnected) {
+      pane.connecting = false;
+      return;
+    }
 
     let url = `${wsBase}?ticket=${encodeURIComponent(ticket)}&offset=${pane.offset}`;
     if (pane.sessionId) url += `&session=${encodeURIComponent(pane.sessionId)}`;
@@ -716,11 +730,13 @@
     try {
       ws = new WebSocket(url);
     } catch (err) {
+      pane.connecting = false;
       scheduleReconnect(pane);
       return;
     }
     ws.binaryType = "arraybuffer";
     pane.ws = ws;
+    pane.connecting = false;
     pane.reconnect = () => connectPane(pane);
 
     ws.onopen = () => {
@@ -820,6 +836,10 @@
     if (!pane.outWriting) flushOutput(pane);
   }
 
+  // 单次 write 的上限：刷屏时待写帧可能很多，按块合并，避免一次分配几 MB
+  // 的连续缓冲；xterm 内部仍会按自己的节奏解析。
+  const MAX_WRITE_BATCH = 256 * 1024;
+
   function flushOutput(pane) {
     if (pane.outQueue.length === 0 || !pane.el.isConnected) {
       pane.outWriting = false;
@@ -827,19 +847,27 @@
       pane.outQueued = 0;
       return;
     }
+    let take = 0;
+    let bytes = 0;
+    while (take < pane.outQueue.length) {
+      const size = pane.outQueue[take].byteLength;
+      if (take > 0 && bytes + size > MAX_WRITE_BATCH) break;
+      bytes += size;
+      take += 1;
+    }
     let chunk;
-    if (pane.outQueue.length === 1) {
+    if (take === 1) {
       chunk = pane.outQueue[0];
     } else {
-      chunk = new Uint8Array(pane.outQueued);
+      chunk = new Uint8Array(bytes);
       let at = 0;
-      for (const part of pane.outQueue) {
-        chunk.set(part, at);
-        at += part.byteLength;
+      for (let i = 0; i < take; i += 1) {
+        chunk.set(pane.outQueue[i], at);
+        at += pane.outQueue[i].byteLength;
       }
     }
-    pane.outQueue = [];
-    pane.outQueued = 0;
+    pane.outQueue.splice(0, take);
+    pane.outQueued -= bytes;
     pane.outWriting = true;
     pane.term.write(chunk, () => flushOutput(pane));
   }
@@ -1228,7 +1256,6 @@
     }
     if (!res.ok) {
       const err = new Error(data.error || `HTTP ${res.status}`);
-      err.status = res.status;
       err.code = data.error || "";
       throw err;
     }

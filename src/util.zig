@@ -22,6 +22,16 @@ pub noinline fn gzipAlloc(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
     return out.toOwnedSlice();
 }
 
+/// 内容版本号：16 位十六进制。静态资源用它生成 `?v=` 缓存键，编辑器用它
+/// 检测“打开之后文件又被改过”。用内容哈希而不是 mtime：粗粒度时间戳的文件
+/// 系统上，同一秒内的两次写入 mtime 相同，哈希不会。
+pub fn contentVersion(body: []const u8) [16]u8 {
+    const h = std.hash.Wyhash.hash(0, body);
+    var be: [8]u8 = undefined;
+    std.mem.writeInt(u64, &be, h, .big);
+    return std.fmt.bytesToHex(be, .lower);
+}
+
 /// 所有响应共用的安全头。API 和静态资源都带上，避免两套路由逐渐走偏。
 /// `Accept-Encoding` 是否接受 gzip（忽略 q 值，只要出现 gzip 就当作可以）。
 pub fn acceptsGzip(request: *const http.Server.Request) bool {
@@ -136,6 +146,14 @@ test "path strips query and fragment" {
     try std.testing.expectEqualStrings("/", pathOnly("/?a=1"));
     try std.testing.expectEqualStrings("/app.js", pathOnly("/app.js?v=1"));
     try std.testing.expectEqualStrings("/a", pathOnly("/a#x"));
+}
+
+test "content version changes with content" {
+    const a = contentVersion("hello\n");
+    const b = contentVersion("hello!\n");
+    try std.testing.expect(!std.mem.eql(u8, &a, &b));
+    const again = contentVersion("hello\n");
+    try std.testing.expectEqualSlices(u8, &a, &again);
 }
 
 test "gzip compresses repetitive input" {

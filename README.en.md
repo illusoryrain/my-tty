@@ -218,7 +218,9 @@ HTTP API: `GET /api/fs/list|read|download`, `PUT /api/fs/write|upload`,
 `read` returns a content hash `version`; when `write` is given `base=<version>`
 and the file has been changed or deleted in the meantime, it answers
 `409 {"error":"modified_on_disk"}` without writing (the editor then asks whether
-to overwrite). Without `base` it overwrites as before.
+to overwrite). Without `base` it overwrites as before. The check compares the
+content immediately before the write; it is not an atomic CAS, so an external
+writer racing the same instant can still be overwritten.
 
 ## Panes
 

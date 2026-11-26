@@ -100,6 +100,39 @@ const ROOT_NAME = path.basename(ROOT);
     "composed insertText after keydown must not double the character"
   );
 
+  // keydown 已经发出字符（Enter）后，紧随其后的 keypress 不能再发一次：
+  // app.js 用 _keyDownHandled 压掉第二条键盘路径。
+  const keyFrames = await page.evaluate(async () => {
+    const ta = document.querySelector(".xterm-helper-textarea");
+    const orig = WebSocket.prototype.send;
+    const sent = [];
+    WebSocket.prototype.send = function (data) {
+      if (typeof data !== "string") {
+        try {
+          sent.push(new TextDecoder().decode(new Uint8Array(data)));
+        } catch (_) {}
+      }
+      return orig.call(this, data);
+    };
+    ta.focus();
+    const kd = new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true, cancelable: true });
+    Object.defineProperty(kd, "keyCode", { get: () => 13 });
+    Object.defineProperty(kd, "which", { get: () => 13 });
+    ta.dispatchEvent(kd);
+    const kp = new KeyboardEvent("keypress", { key: "Enter", bubbles: true, cancelable: true });
+    Object.defineProperty(kp, "keyCode", { get: () => 13 });
+    Object.defineProperty(kp, "charCode", { get: () => 13 });
+    Object.defineProperty(kp, "which", { get: () => 13 });
+    ta.dispatchEvent(kp);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    WebSocket.prototype.send = orig;
+    return sent;
+  });
+  assert(
+    keyFrames.join("") === "\r",
+    "keydown-sent Enter must not be sent again by keypress: " + JSON.stringify(keyFrames)
+  );
+
   await page.locator(".pane-term").click();
   await page.keyboard.type("printf 'FIND_%s\\nOTHER\\nFIND\\n' MARK\r");
   await page.waitForFunction(

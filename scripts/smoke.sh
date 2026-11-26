@@ -62,14 +62,17 @@ ETAG=$(curl -fsSI "$BASE/app.js" | tr -d '\r' | awk 'tolower($1)=="etag:" {print
 pass "gzip + etag"
 
 # 页面里的子资源引用带内容版本号；带当前版本号的请求可以强缓存，裸 URL 仍是 no-cache。
-APP_URL=$(curl -fsS "$BASE/" | grep -o '/app\.js?v=[0-9a-f]\{16\}' | head -n1)
+# 先把整个响应读进变量，避免 curl 写管道时 head/grep -q 提前退出触发 SIGPIPE。
+INDEX_HTML=$(curl -fsS "$BASE/")
+APP_URL=$(printf '%s\n' "$INDEX_HTML" | grep -o '/app\.js?v=[0-9a-f]\{16\}' | sed -n '1p')
 [ -n "$APP_URL" ]
 curl -fsSI "$BASE$APP_URL" | tr -d '\r' | grep -qi '^cache-control: public, max-age=31536000, immutable$'
 curl -fsSI "$BASE/app.js?v=0000000000000000" | tr -d '\r' | grep -qi '^cache-control: no-cache$'
 curl -fsSI "$BASE/app.js" | tr -d '\r' | grep -qi '^cache-control: no-cache$'
-FONT_URL=$(curl -fsS "$BASE/style.css" | grep -o '/vendor/fonts/JetBrainsMono-Regular\.woff2?v=[0-9a-f]\{16\}' | head -n1)
+STYLE_CSS=$(curl -fsS "$BASE/style.css")
+FONT_URL=$(printf '%s\n' "$STYLE_CSS" | grep -o '/vendor/fonts/JetBrainsMono-Regular\.woff2?v=[0-9a-f]\{16\}' | sed -n '1p')
 [ -n "$FONT_URL" ]
-curl -fsS "$BASE/" | grep -qF "href=\"$FONT_URL\""
+printf '%s\n' "$INDEX_HTML" | grep -F "href=\"$FONT_URL\"" >/dev/null
 pass "versioned asset urls"
 
 echo "== auth =="

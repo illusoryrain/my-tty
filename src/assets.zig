@@ -127,15 +127,8 @@ pub fn deinit(allocator: std.mem.Allocator) void {
     for (&all) |*asset| {
         if (asset.gzip) |buf| allocator.free(buf);
         asset.gzip = null;
-    }
-    // "/" 与 "/index.html" 共用同一份改写结果，只释放一次。
-    var freed: ?[*]u8 = null;
-    for (&all) |*asset| {
-        if (asset.owned_body) |buf| {
-            if (freed != buf.ptr) allocator.free(buf);
-            freed = buf.ptr;
-            asset.owned_body = null;
-        }
+        if (asset.owned_body) |buf| allocator.free(buf);
+        asset.owned_body = null;
     }
 }
 
@@ -147,20 +140,13 @@ fn isCss(asset: *const Asset) bool {
     return std.mem.eql(u8, asset.mime, css);
 }
 
-fn contentVersion(body: []const u8) [16]u8 {
-    const h = std.hash.Wyhash.hash(0, body);
-    var be: [8]u8 = undefined;
-    std.mem.writeInt(u64, &be, h, .big);
-    return std.fmt.bytesToHex(be, .lower);
-}
-
 /// 依赖顺序：先给不引用别人的资源（JS、字体）算版本；CSS 可能引用字体，
 /// 改写后再算自己的版本；最后改写 HTML。任何一步内存不足都保留原文，
 /// 对应引用退化成不带版本号的 no-cache URL，功能不受影响。
 fn versionAssets(allocator: std.mem.Allocator) void {
     for (&all) |*asset| {
         if (isHtml(asset) or isCss(asset)) continue;
-        asset.version = contentVersion(asset.body);
+        asset.version = util.contentVersion(asset.body);
     }
     for (&all) |*asset| {
         if (!isCss(asset)) continue;
@@ -168,13 +154,12 @@ fn versionAssets(allocator: std.mem.Allocator) void {
             asset.owned_body = body;
             asset.body = body;
         }
-        asset.version = contentVersion(asset.body);
+        asset.version = util.contentVersion(asset.body);
     }
-    var page: ?[]u8 = null;
+    // "/" 与 "/index.html" 各自持有一份改写结果，释放时不依赖共享指针的顺序。
     for (&all) |*asset| {
         if (!isHtml(asset)) continue;
-        if (page == null) page = rewriteRefs(allocator, asset.body);
-        if (page) |body| {
+        if (rewriteRefs(allocator, asset.body)) |body| {
             asset.owned_body = body;
             asset.body = body;
         }
@@ -182,6 +167,8 @@ fn versionAssets(allocator: std.mem.Allocator) void {
 }
 
 /// 把 body 里所有 `"<path>"` 换成 `"<path>?v=<version>"`；没有任何引用时返回 null。
+/// 引用必须是双引号绝对路径（index.html/style.css 的现有写法）；新增资源引用
+/// 保持这种写法，否则会静默退化成不带版本号的 no-cache URL。
 fn rewriteRefs(allocator: std.mem.Allocator, body: []const u8) ?[]u8 {
     var current: []const u8 = body;
     var owned: ?[]u8 = null;

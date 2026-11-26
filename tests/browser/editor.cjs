@@ -36,6 +36,8 @@ const assert = (c, m) => { if (!c) throw new Error("ASSERT: " + m); };
   await page.keyboard.type(`cd '${ROOT}'\r`);
   await page.click("#toggle-files");
   await page.waitForFunction((n) => { const el = document.querySelector("#crumb button.active"); return !!el && el.textContent === n; }, ROOT_NAME, { timeout: 10000 });
+  // cwd 同步只触发一次列表请求；偶发失败时不重试，显式刷新一次再等行。
+  await page.click("#files-refresh");
   const row = page.locator("#file-list .entry.file", { hasText: "conf.txt" });
   await row.waitFor();
   await row.locator(".name").click();

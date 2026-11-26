@@ -157,7 +157,7 @@ fn read(io: Io, arena: Allocator, request: *http.Server.Request) !void {
         return fail(request, arena, .unsupported_media_type, "binary_file");
 
     const Payload = struct { path: []const u8, content: []const u8, size: u64, version: []const u8 };
-    const version = contentVersion(bytes);
+    const version = util.contentVersion(bytes);
     return respondJson(request, arena, .ok, Payload{
         .path = rel,
         .content = bytes,
@@ -166,22 +166,16 @@ fn read(io: Io, arena: Allocator, request: *http.Server.Request) !void {
     });
 }
 
-/// 文本内容的版本号：编辑器保存时带回来，用来发现“打开之后文件又被别人改过”。
-/// 用内容哈希而不是 mtime：粗粒度时间戳的文件系统上，同一秒内的两次写入
-/// mtime 相同，哈希不会。
-fn contentVersion(bytes: []const u8) [16]u8 {
-    const h = std.hash.Wyhash.hash(0, bytes);
-    var be: [8]u8 = undefined;
-    std.mem.writeInt(u64, &be, h, .big);
-    return std.fmt.bytesToHex(be, .lower);
-}
-
-/// `base` 为空表示调用方不做冲突检查（curl/新建文件）。目标不存在、读不出来
-/// 或超过 max_read 都算冲突：编辑器打开的那份内容已经不是磁盘上的了。
-fn baseMatches(io: Io, arena: Allocator, abs: []const u8, base: []const u8) bool {
+/// `base` 为空表示调用方不做冲突检查（curl/新建文件）。目标不存在或超过
+/// max_read 时无法证明内容一致，按冲突处理；权限/目录等真实错误向上抛，
+/// 由 HTTP 层返回对应状态，不要伪装成“文件已被修改”。
+fn baseMatches(io: Io, arena: Allocator, abs: []const u8, base: []const u8) !bool {
     if (base.len == 0) return true;
-    const current = Dir.cwd().readFileAlloc(io, abs, arena, .limited(max_read + 1)) catch return false;
-    const version = contentVersion(current);
+    const current = Dir.cwd().readFileAlloc(io, abs, arena, .limited(max_read + 1)) catch |err| switch (err) {
+        error.FileNotFound, error.StreamTooLong => return false,
+        else => return err,
+    };
+    const version = util.contentVersion(current);
     return std.mem.eql(u8, &version, base);
 }
 
@@ -208,7 +202,8 @@ fn write(io: Io, gpa: Allocator, arena: Allocator, request: *http.Server.Request
 
     const abs = resolveNew(io, arena, rel) catch |err| return failMapped(request, arena, err);
 
-    if (!baseMatches(io, arena, abs, base)) return fail(request, arena, .conflict, "modified_on_disk");
+    const base_ok = baseMatches(io, arena, abs, base) catch |err| return failMapped(request, arena, err);
+    if (!base_ok) return fail(request, arena, .conflict, "modified_on_disk");
 
     const perms = existingFilePermissions(io, abs) orelse .default_file;
     var atomic = Dir.cwd().createFileAtomic(io, abs, .{
@@ -223,7 +218,7 @@ fn write(io: Io, gpa: Allocator, arena: Allocator, request: *http.Server.Request
     std.debug.print("写入 /{s} ({d} B)\n", .{ logText(&pb, rel), body.len });
 
     const Payload = struct { ok: bool, path: []const u8, size: usize, version: []const u8 };
-    const version = contentVersion(body);
+    const version = util.contentVersion(body);
     return respondJson(request, arena, .ok, Payload{
         .ok = true,
         .path = rel,
@@ -917,12 +912,4 @@ test "upload temp path stays beside the target" {
 test "basename" {
     try std.testing.expectEqualStrings("b.txt", basename("a/b.txt"));
     try std.testing.expectEqualStrings("a.txt", basename("a.txt"));
-}
-
-test "content version changes with content" {
-    const a = contentVersion("hello\n");
-    const b = contentVersion("hello!\n");
-    try std.testing.expect(!std.mem.eql(u8, &a, &b));
-    const again = contentVersion("hello\n");
-    try std.testing.expectEqualSlices(u8, &a, &again);
 }

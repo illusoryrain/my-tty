@@ -1216,8 +1216,8 @@ button.icon {
   }
 }
 
-/* 键盘快捷键提示对触屏设备（包括大屏平板）没有意义，只会挤占顶栏。 */
-@media (pointer: coarse) {
+/* 键盘快捷键提示对触屏设备（包括带精确指针的混合本）没有意义，只会挤占顶栏。 */
+@media (any-pointer: coarse) {
   #bar #hint {
     display: none;
   }
