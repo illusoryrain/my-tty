@@ -1,5 +1,30 @@
 单文件 Web 终端：一个静态链接的 Zig 二进制，内置 PTY、多标签/分屏、密码登录、文件管理器和内嵌前端，不需要 Node、数据库或反向代理。
 
+## 本次更新（v0.1.1）
+
+**修复**
+
+- 手机软键盘每个字符只发一次：兼容 keyup 早于 input、input 非 composed 等事件顺序，`l` 不再变成 `ll`。
+- Enter 不再重复发送：keydown 已经发出回车时，紧随其后的 keypress 被压掉。
+- 编辑器保存冲突：文件在打开后被外部修改或删除时返回 `409 modified_on_disk`，不再静默覆盖；权限、目录等真实错误不再误报成“文件已被修改”。
+- 自动重连竞态：等待 ticket 期间遇到 `online` 或页面回到前台，不会再为同一分屏建出第二条 WebSocket/PTY。
+- 测试稳定性：修掉 smoke 的 SIGPIPE 偶发失败和编辑器浏览器测试的偶发竞态。
+
+**改进**
+
+- 静态资源引用带内容哈希（`?v=…`），命中当前版本时以 `immutable` 强缓存一年；页面本身仍是 `no-cache` + ETag，打开页面不再逐个发 304。
+- 终端输出在 xterm 解析期间合并写入，单批最多 256 KiB，刷屏开销更低。
+- 编辑器行号按帧合并，行数不变不重建 DOM；保存请求未返回时继续输入仍标记为未保存。
+- 网络恢复或页面回到前台立即重连，不再等完最长 30 秒退避。
+- localStorage 不可用时页面仍能启动；分屏拖动只在松手时写一次；删除、丢弃修改、覆盖冲突改用应用内确认框。
+- 预加载终端字体；触屏设备隐藏快捷键提示；复用 TextEncoder。
+
+**测试**
+
+- 新增 `editor` 浏览器测试：保存冲突流程、应用内确认、存储禁用启动、批量输出、偏好持久化。
+- 新增 `mobile_input` 浏览器测试：多种手机输入事件顺序、纯 input、touch、退格/回车只发一次。
+- smoke 增加版本化资源缓存头和写冲突 409 检查。
+
 ## 下载
 
 | 文件 | 平台 |
@@ -43,3 +68,5 @@ xterm.js（MIT）和 JetBrains Mono（OFL 1.1）的完整文本。
 ---
 
 Static single-binary web terminal for Linux (x86_64, aarch64): PTY sessions survive reloads, tabs/panes, password auth, file manager, embedded gzip assets. No Node, database, or reverse proxy required. Built with Zig 0.17.1; see README.en.md.
+
+v0.1.1 fixes duplicated mobile keyboard input, double-sent Enter, editor save conflicts, and reconnect races. Static assets now use content-hashed URLs with immutable caching, terminal output is batched, and large-file gutter work is deferred.
