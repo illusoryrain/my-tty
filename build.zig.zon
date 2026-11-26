@@ -1,6 +1,6 @@
 .{
     .name = .my_tty,
-    .version = "0.1.0",
+    .version = "0.1.1",
     .fingerprint = 0x5376958be8486511,
     .minimum_zig_version = "0.17.1",
     .dependencies = .{},
