@@ -63,6 +63,7 @@ run_test clipboard
 run_test session
 run_test files
 run_test cwd
+run_test editor
 
 if [ "$failures" -ne 0 ]; then
   echo "browser tests: $failures failed" >&2

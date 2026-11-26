@@ -43,7 +43,9 @@ release。CI 里显式传 `-Dtarget`，用的是该架构的 CPU baseline，避�
 参数自行构建。
 
 前端资源在编译期嵌入，启动时把可压缩资源预压缩成 gzip（整体约 730 KiB → 218 KiB，字体本身已是压缩格式），并生成
-本进程唯一的 ETag：浏览器用 `no-cache` 每次校验，命中回 304，重启后自动失效。
+本进程唯一的 ETag。页面里对脚本、样式、字体的引用会带上内容哈希（`/app.js?v=…`），
+这类 URL 以 `immutable` 强缓存一年，打开页面不再逐个发 304 校验；内容一变 URL 就变。
+页面本身和不带版本号的 URL 仍用 `no-cache` + ETag 校验，命中回 304，重启后自动失效。
 大于 1 KiB 的 JSON API 响应同样按需 gzip（大目录列表、文本读取收益最大），
 客户端不支持时自动回退明文。
 
@@ -178,6 +180,9 @@ shell 当前所在目录。
 路径参数一律相对 `/`，会拒绝绝对路径和 `..`；符号链接不做限制。
 HTTP API：`GET /api/fs/list|read|download`、`PUT /api/fs/write|upload`、
 `POST /api/fs/mkdir|rename`、`DELETE /api/fs/delete`。
+`read` 会返回内容哈希 `version`；`write` 带上 `base=<version>` 时，若文件在此期间
+被改动或删除则返回 `409 {"error":"modified_on_disk"}` 且不写入（编辑器据此提示是否覆盖），
+不带 `base` 时照常直接覆盖。
 
 ## 分屏
 

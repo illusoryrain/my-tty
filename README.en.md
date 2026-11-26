@@ -45,9 +45,12 @@ runner's instruction set. There is no 32-bit ARM runner; use the cross-compile
 target above if you need one.
 
 Frontend assets are embedded at compile time, pre-compressed to gzip at startup
-(about 730 KiB -> 218 KiB overall; the font is already compressed), and tagged with a per-process ETag: browsers
-revalidate with `no-cache`, get a 304 on a hit, and automatically pick up new
-files after a restart. JSON API responses above 1 KiB are gzipped on demand as
+(about 730 KiB -> 218 KiB overall; the font is already compressed), and tagged with a per-process ETag.
+References to scripts, stylesheets, and the font inside the page carry a content
+hash (`/app.js?v=…`); those URLs are cached for a year as `immutable`, so opening
+the page no longer revalidates every file, and any content change changes the
+URL. The page itself and unversioned URLs still revalidate with `no-cache`, get
+a 304 on a hit, and automatically pick up new files after a restart. JSON API responses above 1 KiB are gzipped on demand as
 well (big directory listings and text file reads benefit most) and fall back to
 plain text when the client does not accept it.
 
@@ -212,6 +215,10 @@ All path parameters are relative to `/`; absolute paths and `..` are rejected;
 symlinks are not restricted.
 HTTP API: `GET /api/fs/list|read|download`, `PUT /api/fs/write|upload`,
 `POST /api/fs/mkdir|rename`, `DELETE /api/fs/delete`.
+`read` returns a content hash `version`; when `write` is given `base=<version>`
+and the file has been changed or deleted in the meantime, it answers
+`409 {"error":"modified_on_disk"}` without writing (the editor then asks whether
+to overwrite). Without `base` it overwrites as before.
 
 ## Panes
 

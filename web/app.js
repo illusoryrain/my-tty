@@ -41,6 +41,8 @@
   const promptInput = document.getElementById("prompt-input");
   const promptError = document.getElementById("prompt-error");
   const promptCancel = document.getElementById("prompt-cancel");
+  const promptOk = document.getElementById("prompt-ok");
+  const promptMessage = document.getElementById("prompt-message");
   const findBar = document.getElementById("find-bar");
   const findInput = document.getElementById("find-input");
   const findCount = document.getElementById("find-count");
@@ -63,6 +65,23 @@
     typeof window.matchMedia === "function" &&
     window.matchMedia("(pointer: coarse)").matches;
 
+  // localStorage 在隐私模式、禁用站点数据或配额满时会抛异常；偏好设置
+  // 只是锦上添花，读写失败一律当作“没有存过”，绝不能让页面启动失败。
+  const store = {
+    get(key) {
+      try {
+        return localStorage.getItem(key);
+      } catch (_) {
+        return null;
+      }
+    },
+    set(key, value) {
+      try {
+        localStorage.setItem(key, value);
+      } catch (_) {}
+    },
+  };
+
   // 每个标签页有自己的 pane 数组；`panes` 始终指向当前标签页的数组。
   const tabs = [];
   let activeTab = null;
@@ -74,13 +93,13 @@
   const treeChildren = new Map();
   const treeLoading = new Set();
   let treeRootError = false;
-  let cwdSyncEnabled = localStorage.getItem("myttty.cwdSync") !== "0";
+  let cwdSyncEnabled = store.get("myttty.cwdSync") !== "0";
   let editing = null; // { path, dirty }
   let started = false;
-  let fontsize = clampFont(parseInt(localStorage.getItem("myttty.fontsize") || "14", 10) || 14);
-  let splitX = parseFloat(localStorage.getItem("myttty.splitX") || "0.5") || 0.5;
-  let splitY = parseFloat(localStorage.getItem("myttty.splitY") || "0.5") || 0.5;
-  let filesWidth = parseInt(localStorage.getItem("myttty.filesWidth") || "300", 10);
+  let fontsize = clampFont(parseInt(store.get("myttty.fontsize") || "14", 10) || 14);
+  let splitX = parseFloat(store.get("myttty.splitX") || "0.5") || 0.5;
+  let splitY = parseFloat(store.get("myttty.splitY") || "0.5") || 0.5;
+  let filesWidth = parseInt(store.get("myttty.filesWidth") || "300", 10);
   if (!Number.isFinite(filesWidth)) filesWidth = 300;
   let uploader = null; // { xhr, url, cancelled }
 
@@ -551,6 +570,10 @@
       retryAttempt: 0,
       retryable: true,
       opens: 0,
+      // 终端输出写队列：xterm 还在解析上一批时到达的帧先攒起来，下一批合成一次 write。
+      outQueue: [],
+      outQueued: 0,
+      outWriting: false,
     };
     tab.panes.push(pane);
     tab.activePane = pane;
@@ -718,7 +741,7 @@
       if (typeof event.data !== "string") {
         const bytes = new Uint8Array(event.data);
         pane.offset += bytes.byteLength;
-        pane.term.write(bytes);
+        queueOutput(pane, bytes);
         return;
       }
       let msg;
@@ -788,6 +811,39 @@
     };
   }
 
+  // 刷屏（cat 大文件、编译日志）时服务端每次 PTY 读取就是一帧；逐帧 term.write
+  // 会让 xterm 排起成千上万个小任务。这里同一时间只让一批在 xterm 里解析，
+  // 期间到达的帧在完成回调里合并成一次 write。顺序不变，也不丢字节。
+  function queueOutput(pane, bytes) {
+    pane.outQueue.push(bytes);
+    pane.outQueued += bytes.byteLength;
+    if (!pane.outWriting) flushOutput(pane);
+  }
+
+  function flushOutput(pane) {
+    if (pane.outQueue.length === 0 || !pane.el.isConnected) {
+      pane.outWriting = false;
+      pane.outQueue = [];
+      pane.outQueued = 0;
+      return;
+    }
+    let chunk;
+    if (pane.outQueue.length === 1) {
+      chunk = pane.outQueue[0];
+    } else {
+      chunk = new Uint8Array(pane.outQueued);
+      let at = 0;
+      for (const part of pane.outQueue) {
+        chunk.set(part, at);
+        at += part.byteLength;
+      }
+    }
+    pane.outQueue = [];
+    pane.outQueued = 0;
+    pane.outWriting = true;
+    pane.term.write(chunk, () => flushOutput(pane));
+  }
+
   // 半开连接（手机锁屏、掉 Wi-Fi、笔记本睡眠）不会触发 onclose，只能靠心跳发现。
   const HEARTBEAT_MS = 20000;
   const STALE_MS = 55000;
@@ -842,6 +898,27 @@
     }, delay);
   }
 
+  /// 网络恢复或页面回到前台时，正在退避等待的分屏立即重连，而不是等完
+  /// 剩下的（最长 30 秒）退避时间。被接管/shell 已退出的分屏不自动重连。
+  function reconnectWaitingPanes() {
+    if (!started) return;
+    for (const tab of tabs) {
+      for (const pane of tab.panes) {
+        if (pane.alive || !pane.retryable || !pane.el.isConnected) continue;
+        const ws = pane.ws;
+        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) continue;
+        if (pane.retryTimer) {
+          clearTimeout(pane.retryTimer);
+          pane.retryTimer = null;
+        }
+        pane.retryAttempt = 0;
+        connectPane(pane);
+      }
+    }
+  }
+
+  window.addEventListener("online", reconnectWaitingPanes);
+
   /// 登录成功后把因为 401 停下来的分屏全部重新拉起来。
   function retryDeadPanes() {
     for (const tab of tabs) {
@@ -892,6 +969,8 @@
     } catch (_) {}
   }
 
+  const textEncoder = new TextEncoder();
+
   function sendInput(pane, data) {
     if (ctrlSticky && data.length === 1) {
       const code = data.toUpperCase().charCodeAt(0);
@@ -901,7 +980,7 @@
     }
     const ws = pane.ws;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    const bytes = new TextEncoder().encode(data);
+    const bytes = textEncoder.encode(data);
     const CHUNK = 8192;
     for (let i = 0; i < bytes.length; i += CHUNK) {
       ws.send(bytes.subarray(i, i + CHUNK));
@@ -987,11 +1066,9 @@
       if (axis === "x") {
         splitX = clampSplit((e.clientX - r.left) / r.width);
         activeTab.splitX = splitX;
-        localStorage.setItem("myttty.splitX", String(splitX));
       } else {
         splitY = clampSplit((e.clientY - r.top) / r.height);
         activeTab.splitY = splitY;
-        localStorage.setItem("myttty.splitY", String(splitY));
       }
       applyGrid(activeTab);
     };
@@ -1000,6 +1077,8 @@
       el.removeEventListener("pointermove", move);
       el.removeEventListener("pointerup", up);
       el.removeEventListener("pointercancel", up);
+      // localStorage 是同步写盘：拖动过程中只改内存，松手时写一次。
+      store.set(axis === "x" ? "myttty.splitX" : "myttty.splitY", String(axis === "x" ? splitX : splitY));
       saveSessions();
     };
     el.addEventListener("pointermove", move);
@@ -1147,7 +1226,12 @@
       showLogin("登录已失效，请重新登录");
       throw new Error("unauthorized");
     }
-    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    if (!res.ok) {
+      const err = new Error(data.error || `HTTP ${res.status}`);
+      err.status = res.status;
+      err.code = data.error || "";
+      throw err;
+    }
     return data;
   }
 
@@ -1172,11 +1256,7 @@
     const max = Math.max(200, body.clientWidth - 320);
     filesWidth = Math.round(Math.min(Math.max(next, 180), max));
     filesEl.style.setProperty("--files-width", `${filesWidth}px`);
-    if (persist) {
-      try {
-        localStorage.setItem("myttty.filesWidth", String(filesWidth));
-      } catch (_) {}
-    }
+    if (persist) store.set("myttty.filesWidth", String(filesWidth));
   }
 
   function setCwdSync(enabled, persist = true) {
@@ -1184,11 +1264,7 @@
     cwdSyncBtn.classList.toggle("off", !enabled);
     cwdSyncBtn.setAttribute("aria-pressed", enabled ? "true" : "false");
     cwdSyncBtn.title = enabled ? "目录跟随：开（点击关闭）" : "目录跟随：关（点击开启）";
-    if (persist) {
-      try {
-        localStorage.setItem("myttty.cwdSync", enabled ? "1" : "0");
-      } catch (_) {}
-    }
+    if (persist) store.set("myttty.cwdSync", enabled ? "1" : "0");
     if (!enabled || !activePane) return;
     // 重新开启时立即对齐；请求一次 cwd 覆盖关闭期间发生的 cd。
     if (activePane.cwd) syncFilesToCwd(activePane.cwd);
@@ -1690,7 +1766,7 @@
   }
 
   async function deleteEntry(path, name, isDir) {
-    if (!confirm(`删除 ${name}？此操作不可撤销。`)) return;
+    if (!(await askConfirm(`删除 ${name}？`, "此操作不可撤销。", "删除", true))) return;
     const parentPath = parentOf(path);
     try {
       await api("DELETE", "delete", { path });
@@ -1910,6 +1986,10 @@
   function askText(title, initial = "") {
     return new Promise((resolve) => {
       promptTitle.textContent = title;
+      promptMessage.hidden = true;
+      promptInput.hidden = false;
+      promptOk.textContent = "确定";
+      promptOk.classList.remove("danger");
       promptInput.value = initial;
       promptError.textContent = "";
       promptOverlay.hidden = false;
@@ -1938,6 +2018,50 @@
           event.preventDefault();
           event.stopPropagation();
           finish(null);
+        }
+      };
+
+      promptForm.addEventListener("submit", onSubmit);
+      promptForm.addEventListener("keydown", onKey);
+      promptCancel.addEventListener("click", onCancel);
+    });
+  }
+
+  // 应用内确认弹窗，替代原生 confirm()：风格一致，也不会被移动端/iframe 拦截。
+  // 返回 true 表示确认。
+  function askConfirm(title, message, okLabel = "确定", danger = false) {
+    return new Promise((resolve) => {
+      promptTitle.textContent = title;
+      promptMessage.textContent = message;
+      promptMessage.hidden = !message;
+      promptInput.hidden = true;
+      promptError.textContent = "";
+      promptOk.textContent = okLabel;
+      promptOk.classList.toggle("danger", danger);
+      promptOverlay.hidden = false;
+      promptOk.focus();
+
+      const finish = (value) => {
+        promptOverlay.hidden = true;
+        promptInput.hidden = false;
+        promptMessage.hidden = true;
+        promptOk.textContent = "确定";
+        promptOk.classList.remove("danger");
+        promptForm.removeEventListener("submit", onSubmit);
+        promptForm.removeEventListener("keydown", onKey);
+        promptCancel.removeEventListener("click", onCancel);
+        resolve(value);
+      };
+      const onSubmit = (event) => {
+        event.preventDefault();
+        finish(true);
+      };
+      const onCancel = () => finish(false);
+      const onKey = (event) => {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          event.stopPropagation();
+          finish(false);
         }
       };
 
@@ -1979,11 +2103,12 @@
 
   async function openEditor(path) {
     if (editing && editing.dirty && editing.path !== path) {
-      if (!confirm("当前文件有未保存的修改，确定切换？")) return;
+      if (!(await askConfirm("放弃未保存的修改？", `${editing.path} 有未保存的修改，切换后会丢失。`, "放弃并切换", true))) return;
     }
     try {
       const data = await api("GET", "read", { path });
-      editing = { path, dirty: false };
+      // version 是服务端给的内容哈希；保存时带回去，文件在此期间被改过就会被拒绝。
+      editing = { path, dirty: false, version: data.version || "" };
       editorPathEl.textContent = path;
       editorEl.value = data.content;
       editorStateEl.textContent = `${data.size} 字节 · 未修改`;
@@ -1996,21 +2121,43 @@
     }
   }
 
-  function closeEditor() {
-    if (editing && editing.dirty && !confirm("有未保存的修改，确定关闭？")) return;
+  async function closeEditor() {
+    if (editing && editing.dirty) {
+      if (!(await askConfirm("放弃未保存的修改？", `${editing.path} 有未保存的修改，关闭后会丢失。`, "放弃并关闭", true))) return;
+    }
     editing = null;
     editorOverlay.hidden = true;
   }
 
-  async function saveEditor() {
+  async function saveEditor(force = false) {
     if (!editing) return;
+    const target = editing;
+    const query = { path: target.path };
+    if (!force && target.version) query.base = target.version;
+    const text = editorEl.value;
     try {
-      const res = await api("PUT", "write", { path: editing.path }, editorEl.value);
-      editing.dirty = false;
-      editorStateEl.textContent = `${res.size} 字节 · 已保存`;
+      const res = await api("PUT", "write", query, text);
+      if (editing !== target) return;
+      editing.version = res.version || "";
+      // 保存请求在路上时用户可能又敲了字：那部分仍算未保存。
+      editing.dirty = editorEl.value !== text;
+      editorStateEl.textContent = editing.dirty ? "未保存的修改" : `${res.size} 字节 · 已保存`;
       notice(`已保存 ${editing.path}`);
       refreshFiles([parentOf(editing.path)]);
     } catch (err) {
+      if (editing !== target) return;
+      if (err.code === "modified_on_disk") {
+        editorStateEl.textContent = "文件已在别处被修改";
+        const overwrite = await askConfirm(
+          "文件已在别处被修改",
+          `${target.path} 在打开之后被其他程序改过（或已被删除）。覆盖会丢掉那些修改。`,
+          "仍然覆盖",
+          true
+        );
+        if (overwrite && editing === target) saveEditor(true);
+        else editorEl.focus();
+        return;
+      }
       editorStateEl.textContent = `保存失败: ${err.message}`;
       notice(`保存失败: ${err.message}`, true);
     }
@@ -2020,7 +2167,7 @@
     if (!editing) return;
     editing.dirty = true;
     editorStateEl.textContent = "未保存的修改";
-    updateGutter();
+    scheduleGutter();
   });
   editorEl.addEventListener("keydown", (ev) => {
     if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "s") {
@@ -2028,7 +2175,7 @@
       saveEditor();
     }
   });
-  editorSaveBtn.addEventListener("click", saveEditor);
+  editorSaveBtn.addEventListener("click", () => saveEditor());
   editorCloseBtn.addEventListener("click", closeEditor);
   window.addEventListener("keydown", (ev) => {
     if (!promptOverlay.hidden) return;
@@ -2169,9 +2316,10 @@
   });
   ro.observe(workspace);
 
+  // 终端尺寸统一交给上面的 ResizeObserver（已按帧合并）；这里再 fit 一遍
+  // 只会让每次窗口拖动多做一轮强制同步布局。
   window.addEventListener("resize", () => {
     setFilesWidth(filesWidth);
-    panes.forEach(fitPane);
     layoutTabs();
   });
   if (document.fonts && document.fonts.ready) {
@@ -2190,6 +2338,7 @@
           sendPing(pane);
         }
       }
+      reconnectWaitingPanes();
     }
   });
 
@@ -2271,7 +2420,7 @@
 
   function setFontSize(next) {
     fontsize = clampFont(next);
-    localStorage.setItem("myttty.fontsize", String(fontsize));
+    store.set("myttty.fontsize", String(fontsize));
     for (const tab of tabs) {
       for (const p of tab.panes) {
         p.term.options.fontSize = fontsize;
@@ -2342,15 +2491,37 @@
 
   // ------------------------------------------------------------- 编辑辅助
 
-  function updateGutter() {
-    const value = editorEl.value;
-    let count = value.split("\n").length;
+  // 大文件（上限 1 MiB，可能几万行）每按一个键都重建行号会明显卡顿：
+  // 输入事件按帧合并，行数没变就不动 DOM。
+  let gutterLines = 0;
+  let gutterQueued = false;
+
+  function countLines(value) {
+    let count = 1;
+    let i = -1;
+    while ((i = value.indexOf("\n", i + 1)) !== -1) count += 1;
     if (value.endsWith("\n")) count -= 1;
-    count = Math.max(1, count);
-    let text = "";
-    for (let i = 1; i <= count; i++) text += i + "\n";
-    editorGutter.textContent = text;
+    return Math.max(1, count);
+  }
+
+  function updateGutter() {
+    const count = countLines(editorEl.value);
+    if (count !== gutterLines) {
+      gutterLines = count;
+      const lines = new Array(count);
+      for (let i = 0; i < count; i++) lines[i] = i + 1;
+      editorGutter.textContent = lines.join("\n") + "\n";
+    }
     editorGutter.scrollTop = editorEl.scrollTop;
+  }
+
+  function scheduleGutter() {
+    if (gutterQueued) return;
+    gutterQueued = true;
+    requestAnimationFrame(() => {
+      gutterQueued = false;
+      updateGutter();
+    });
   }
 
   editorEl.addEventListener("scroll", () => {

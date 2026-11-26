@@ -498,13 +498,18 @@ fn handleHttp(
     };
     const use_gzip = asset.gzip != null and util.acceptsGzip(request);
     const tag = assets.etag(use_gzip);
-    if (ifNoneMatch(request, tag)) return respondNotModified(request, asset, tag);
+    // 带着当前内容版本号的 URL 可以强缓存；旧版本号或没带版本号的仍走 no-cache。
+    const cache_control = if (asset.versionMatches(util.queryParam(request.head.target, "v")))
+        assets.immutable_cache_control
+    else
+        asset.cache_control;
+    if (ifNoneMatch(request, tag)) return respondNotModified(request, cache_control, tag);
 
     var extra: [5]http.Header = undefined;
     var n: usize = 0;
     extra[n] = .{ .name = "content-type", .value = asset.mime };
     n += 1;
-    extra[n] = .{ .name = "cache-control", .value = asset.cache_control };
+    extra[n] = .{ .name = "cache-control", .value = cache_control };
     n += 1;
     extra[n] = .{ .name = "etag", .value = tag };
     n += 1;
@@ -532,9 +537,9 @@ fn ifNoneMatch(request: *const http.Server.Request, tag: []const u8) bool {
     return false;
 }
 
-fn respondNotModified(request: *http.Server.Request, asset: *const assets.Asset, tag: []const u8) !void {
+fn respondNotModified(request: *http.Server.Request, cache_control: []const u8, tag: []const u8) !void {
     var extra = [_]http.Header{
-        .{ .name = "cache-control", .value = asset.cache_control },
+        .{ .name = "cache-control", .value = cache_control },
         .{ .name = "etag", .value = tag },
         .{ .name = "vary", .value = "accept-encoding" },
     };

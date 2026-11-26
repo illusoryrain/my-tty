@@ -5,6 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="dark" />
     <title>my-tty</title>
+    <!-- 字体是 font-display: block，提前发起请求缩短首屏空白；href 必须与 style.css 里的一致。 -->
+    <link rel="preload" href="/vendor/fonts/JetBrainsMono-Regular.woff2" as="font" type="font/woff2" crossorigin />
     <link rel="stylesheet" href="/vendor/xterm/xterm.css" />
     <link rel="stylesheet" href="/style.css" />
   </head>
@@ -85,6 +87,7 @@
     <div id="prompt-overlay" hidden>
       <form id="prompt-form" class="prompt-card">
         <h1 id="prompt-title">新建</h1>
+        <p id="prompt-message" hidden></p>
         <input id="prompt-input" type="text" autocomplete="off" spellcheck="false" />
         <p id="prompt-error"></p>
         <div class="prompt-actions">

@@ -61,6 +61,17 @@ ETAG=$(curl -fsSI "$BASE/app.js" | tr -d '\r' | awk 'tolower($1)=="etag:" {print
 [ "$(curl -sS -o /dev/null -w '%{http_code}' -H "If-None-Match: $ETAG" "$BASE/app.js")" = "304" ]
 pass "gzip + etag"
 
+# 页面里的子资源引用带内容版本号；带当前版本号的请求可以强缓存，裸 URL 仍是 no-cache。
+APP_URL=$(curl -fsS "$BASE/" | grep -o '/app\.js?v=[0-9a-f]\{16\}' | head -n1)
+[ -n "$APP_URL" ]
+curl -fsSI "$BASE$APP_URL" | tr -d '\r' | grep -qi '^cache-control: public, max-age=31536000, immutable$'
+curl -fsSI "$BASE/app.js?v=0000000000000000" | tr -d '\r' | grep -qi '^cache-control: no-cache$'
+curl -fsSI "$BASE/app.js" | tr -d '\r' | grep -qi '^cache-control: no-cache$'
+FONT_URL=$(curl -fsS "$BASE/style.css" | grep -o '/vendor/fonts/JetBrainsMono-Regular\.woff2?v=[0-9a-f]\{16\}' | head -n1)
+[ -n "$FONT_URL" ]
+curl -fsS "$BASE/" | grep -qF "href=\"$FONT_URL\""
+pass "versioned asset urls"
+
 echo "== auth =="
 for path in "/api/fs/list?path=" "/api/fs/download?path=x" "/api/fs/upload?path=x" "/api/auth/status" "/api/auth/ticket" "/api/auth/logout"; do
   code=$(curl -sS -o /dev/null -w '%{http_code}' -X GET "$BASE$path")
@@ -96,6 +107,18 @@ pass write
 
 curl -fsS -b "$COOKIE_JAR" "$API/read?path=$REL/note.txt" | grep -c 'smoke content' >/dev/null
 pass read
+
+# 编辑器冲突检测：带着打开时的 version 保存，文件期间被改过就返回 409。
+VERSION=$(curl -fsS -b "$COOKIE_JAR" "$API/read?path=$REL/note.txt" | grep -o '"version":"[0-9a-f]*"' | cut -d'"' -f4)
+[ -n "$VERSION" ]
+printf 'changed elsewhere' >"$ROOT/note.txt"
+[ "$(curl -sS -o /dev/null -w '%{http_code}' -X PUT -b "$COOKIE_JAR" --data-binary 'stale' \
+  "$API/write?path=$REL/note.txt&base=$VERSION")" = "409" ]
+[ "$(cat "$ROOT/note.txt")" = "changed elsewhere" ]
+VERSION=$(curl -fsS -b "$COOKIE_JAR" "$API/read?path=$REL/note.txt" | grep -o '"version":"[0-9a-f]*"' | cut -d'"' -f4)
+curl -fsS -X PUT -b "$COOKIE_JAR" --data-binary 'smoke content' \
+  "$API/write?path=$REL/note.txt&base=$VERSION" | grep -c '"ok":true' >/dev/null
+pass "write conflict"
 
 # 大 JSON（文本文件读取、大目录列表）应压缩；解压后必须和明文完全一致。
 head -c 4096 /dev/zero | tr '\0' 'a' >"$UPLOAD_SRC"

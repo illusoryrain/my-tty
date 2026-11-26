@@ -1043,6 +1043,19 @@ button.icon {
   border-color: #333b4b;
 }
 
+#prompt-message {
+  margin: 0 0 4px;
+  color: var(--fg);
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+#prompt-ok.danger {
+  border-color: var(--err);
+  color: var(--err);
+}
+
 /* --------------------------------------------------------------- login */
 
 #login-overlay {
@@ -1199,6 +1212,13 @@ button.icon {
    注意用 #bar #send-interrupt 压过前面的 #bar button { display:inline-flex }。 */
 @media (max-width: 820px), (pointer: coarse) {
   #bar #send-interrupt {
+    display: none;
+  }
+}
+
+/* 键盘快捷键提示对触屏设备（包括大屏平板）没有意义，只会挤占顶栏。 */
+@media (pointer: coarse) {
+  #bar #hint {
     display: none;
   }
 }
