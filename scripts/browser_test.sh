@@ -7,6 +7,8 @@ PORT="${PORT:-17389}"
 PASSWORD="browser-$(date +%s)"
 ROOT="$(mktemp -d)"
 LOG="$(mktemp)"
+CONFIG="$(mktemp)"
+echo '{}' >"$CONFIG"
 PID=""
 
 cleanup() {
@@ -14,9 +16,14 @@ cleanup() {
     kill "$PID" 2>/dev/null || true
     wait "$PID" 2>/dev/null || true
   fi
-  rm -rf "$ROOT" "$LOG"
+  rm -rf "$ROOT" "$LOG" "$CONFIG"
 }
 trap cleanup EXIT
+
+if curl -fsS "http://127.0.0.1:$PORT/" >/dev/null 2>&1; then
+  echo "端口 $PORT 已被占用，请换一个 PORT" >&2
+  exit 2
+fi
 
 if [ ! -d tests/browser/node_modules ]; then
   echo "缺少 tests/browser/node_modules，请先执行：npm --prefix tests/browser ci" >&2
@@ -24,13 +31,14 @@ if [ ! -d tests/browser/node_modules ]; then
 fi
 
 zig build -Doptimize=safe
-HOME="$ROOT" ./zig-out/bin/my-tty --port "$PORT" --password "$PASSWORD" >"$LOG" 2>&1 &
+HOME="$ROOT" ./zig-out/bin/my-tty --config "$CONFIG" --port "$PORT" --password "$PASSWORD" >"$LOG" 2>&1 &
 PID=$!
 
 for _ in $(seq 1 50); do
   curl -fsS "http://127.0.0.1:$PORT/" >/dev/null 2>&1 && break
   sleep 0.1
 done
+kill -0 "$PID" 2>/dev/null || { echo "my-tty 启动失败，见 $LOG" >&2; cat "$LOG" >&2; exit 1; }
 
 export BASE="http://127.0.0.1:$PORT"
 export PASSWORD ROOT
@@ -40,7 +48,7 @@ failures=0
 run_test() {
   local name="$1"
   local output
-  if output=$(node "tests/browser/$name.cjs" 2>&1); then
+  if output=$(timeout 180 node "tests/browser/$name.cjs" 2>&1); then
     printf '%s\n' "$output"
     return 0
   fi

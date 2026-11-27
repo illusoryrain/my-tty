@@ -24,7 +24,7 @@
 ```sh
 zig build                    # Debug：带调试信息，体积大，仅本地调试用
 zig test src/tests.zig
-./zig-out/bin/my-tty --port 7387 --password 'change-me'
+./zig-out/bin/my-tty --port 7387 --password 'my-tty-please-change-this'
 # 浏览器打开 http://127.0.0.1:7387/ ，在弹窗里输入密码
 
 ./scripts/build-release.sh                # 发布：ReleaseSafe + strip，约 1.4 MiB
@@ -54,7 +54,7 @@ release。CI 里显式传 `-Dtarget`，用的是该架构的 CPU baseline，避�
 指定 shell：
 
 ```sh
-./zig-out/bin/my-tty --shell /bin/zsh --password 'change-me'
+./zig-out/bin/my-tty --shell /bin/zsh --password 'my-tty-please-change-this'
 ```
 
 终端里的 shell 是 **login shell**：家目录和身份按当前运行用户的 `/etc/passwd`
@@ -74,7 +74,7 @@ release。CI 里显式传 `-Dtarget`，用的是该架构的 CPU baseline，避�
   "host": "127.0.0.1",
   "port": 7387,
   "shell": "/bin/bash",
-  "password": "please-change-me",
+  "password": "replace-with-a-long-random-password",
   "session_ttl_days": 7,
   "session_idle_hours": 24,
   "max_connections": 64,
@@ -88,6 +88,18 @@ release。CI 里显式传 `-Dtarget`，用的是该架构的 CPU baseline，避�
 `MYTTY_MAX_CONNECTIONS`、`MYTTY_MAX_SESSIONS`、`MYTTY_PTY_IDLE_MINUTES`。
 完整参数见 `my-tty --help`；仓库里有一份 `my-tty.example.json`。
 `my-tty --check-config` 只校验配置，不启动服务。
+
+## 验证发布包
+
+从 GitHub Releases 下载对应架构的 `my-tty-<version>-<arch>-linux.tar.gz` 和
+`SHA256SUMS`，先校验再解压：
+
+```sh
+sha256sum -c SHA256SUMS --ignore-missing
+tar -xzf my-tty-<version>-<arch>-linux.tar.gz
+```
+
+`my-tty --version` 应输出与 tag 一致的版本号。
 
 ## 作为 systemd 服务
 

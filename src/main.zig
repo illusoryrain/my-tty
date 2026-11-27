@@ -19,6 +19,10 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("{s}", .{config.Config.usage});
             return;
         }
+        if (std.mem.eql(u8, arg, "--version")) {
+            std.debug.print("my-tty {s}\n", .{config.version});
+            return;
+        }
     }
 
     var cfg = config.Config.parse(arena, init) catch |err| {
@@ -63,6 +67,9 @@ fn describe(err: config.Config.ParseError) []const u8 {
         error.InvalidMaxSessions => "会话数上限至少为 1",
         error.InvalidHost => "监听地址必须是 IPv4 字面量",
         error.EmptyPassword => "密码不能为空",
+        error.WeakPassword => "密码太弱：至少 8 位，且不能使用 change-me/password",
+        error.InvalidShell => "shell 必须是绝对路径",
+        error.ShellNotFound => "shell 不存在或不可执行",
         error.InvalidSessionTtl => "登录有效期必须在 1–365 天，空闲超时不得超过 8760 小时",
         error.InvalidMaxConnections => "最大连接数必须在 1–4096 之间",
         error.InvalidPtyIdle => "pty 保留时间不得超过 7 天（10080 分钟）",

@@ -39,21 +39,126 @@ const closed_grace_ns: i96 = 60 * std.time.ns_per_s;
 
 pub const Attachment = struct {
     io: Io,
+    gpa: Allocator,
     ws: *http.Server.WebSocket,
     stream: *const net.Stream,
     session: ?*Session = null,
+    /// 直接写 socket 时用（attach 失败的错误帧）；正常输出走队列。
     send_mutex: Io.Mutex = .init,
     /// pump/attach 与连接线程会并发读写，必须是原子量。
     alive: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
 
+    /// 每个前端一条写线程。pump 只把输出放进队列，绝不在持有 session 锁时
+    /// 阻塞在慢客户端上；队列有硬上限，超过就断开，避免无限占内存。
+    out_mutex: Io.Mutex = .init,
+    out_cond: Io.Condition = .init,
+    out_queue: std.ArrayList(Frame) = .empty,
+    out_bytes: usize = 0,
+    out_inflight: bool = false,
+    out_closed: bool = false,
+    writer: ?std.Thread = null,
+
+    const max_out_bytes: usize = 1024 * 1024;
+    const Frame = struct {
+        data: []u8,
+        op: http.Server.WebSocket.Opcode,
+    };
+
+    fn startWriter(self: *Attachment) !void {
+        self.writer = try std.Thread.spawn(.{}, writerLoop, .{self});
+    }
+
+    fn stopWriter(self: *Attachment) void {
+        self.out_mutex.lockUncancelable(self.io);
+        self.out_closed = true;
+        self.out_cond.broadcast(self.io);
+        self.out_mutex.unlock(self.io);
+        // 唤醒可能卡在慢客户端写操作里的 writer，否则 join 会一直等。
+        self.stream.shutdown(self.io, .both) catch {};
+        if (self.writer) |thread| {
+            thread.join();
+            self.writer = null;
+        }
+        self.dropQueued();
+    }
+
+    fn dropQueued(self: *Attachment) void {
+        self.out_mutex.lockUncancelable(self.io);
+        defer self.out_mutex.unlock(self.io);
+        for (self.out_queue.items) |frame| self.gpa.free(frame.data);
+        self.out_queue.clearRetainingCapacity();
+        self.out_bytes = 0;
+    }
+
     fn sendRaw(self: *Attachment, data: []const u8, op: http.Server.WebSocket.Opcode) !void {
-        self.send_mutex.lockUncancelable(self.io);
-        defer self.send_mutex.unlock(self.io);
-        try self.ws.writeMessage(data, op);
+        if (!self.alive.load(.acquire)) return error.Closed;
+        self.out_mutex.lockUncancelable(self.io);
+        defer self.out_mutex.unlock(self.io);
+        if (self.out_closed) return error.Closed;
+        if (self.out_bytes + data.len > max_out_bytes) return error.QueueFull;
+        const copy = self.gpa.dupe(u8, data) catch return error.OutOfMemory;
+        self.out_queue.append(self.gpa, .{ .data = copy, .op = op }) catch {
+            self.gpa.free(copy);
+            return error.OutOfMemory;
+        };
+        self.out_bytes += copy.len;
+        self.out_cond.signal(self.io);
     }
 
     fn sendText(self: *Attachment, data: []const u8) !void {
         return self.sendRaw(data, .text);
+    }
+
+    fn writerLoop(self: *Attachment) void {
+        while (true) {
+            self.out_mutex.lockUncancelable(self.io);
+            while (self.out_queue.items.len == 0 and !self.out_closed) {
+                self.out_cond.waitUncancelable(self.io, &self.out_mutex);
+            }
+            if (self.out_queue.items.len == 0 and self.out_closed) {
+                self.out_mutex.unlock(self.io);
+                return;
+            }
+            const frame = self.out_queue.orderedRemove(0);
+            self.out_bytes -= frame.data.len;
+            self.out_inflight = true;
+            self.out_mutex.unlock(self.io);
+
+            self.send_mutex.lockUncancelable(self.io);
+            self.ws.writeMessage(frame.data, frame.op) catch {
+                self.send_mutex.unlock(self.io);
+                self.out_mutex.lockUncancelable(self.io);
+                self.out_inflight = false;
+                self.out_mutex.unlock(self.io);
+                self.alive.store(false, .release);
+                self.stream.shutdown(self.io, .both) catch {};
+                self.gpa.free(frame.data);
+                return;
+            };
+            self.send_mutex.unlock(self.io);
+            const closing = frame.op == .connection_close;
+            self.gpa.free(frame.data);
+            self.out_mutex.lockUncancelable(self.io);
+            self.out_inflight = false;
+            self.out_mutex.unlock(self.io);
+            if (closing) {
+                self.stream.shutdown(self.io, .both) catch {};
+                return;
+            }
+        }
+    }
+
+    /// 等旧前端的关闭帧发出去，最多 200ms；超时后由调用方直接 shutdown。
+    fn waitOutEmpty(self: *Attachment, timeout_ms: u32) void {
+        var waited: u32 = 0;
+        while (waited < timeout_ms) {
+            self.out_mutex.lockUncancelable(self.io);
+            const empty = self.out_queue.items.len == 0 and !self.out_inflight;
+            self.out_mutex.unlock(self.io);
+            if (empty) return;
+            Io.sleep(self.io, Io.Duration.fromMilliseconds(2), .real) catch return;
+            waited += 2;
+        }
     }
 };
 
@@ -64,14 +169,17 @@ pub const Attachment = struct {
 const taken_over_close = [2]u8{ 0x0F, 0xA1 }; // 4001
 
 fn sendTakenOver(att: *Attachment) void {
-    // 拿不到发送锁说明旧前端正在写（可能卡在慢客户端上），直接跳过：
-    // 关闭码只是提示，拿不到就退化成普通的异常断开。
-    if (!att.send_mutex.tryLock()) return;
-    defer att.send_mutex.unlock(att.io);
-    // 旧客户端的接收窗口可能已经满了；最多等 1 秒，绝不能拖住 attach。
-    var tv: posix.timeval = .{ .sec = 1, .usec = 0 };
-    posix.setsockopt(att.stream.socket.handle, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
-    att.ws.writeMessage(&taken_over_close, .connection_close) catch {};
+    // 写线程空闲时直接发 4001：关闭帧必须让浏览器看到 4001，否则旧页面
+    // 会把它当成异常断开并自动重连，形成两个窗口互相抢会话。
+    if (att.send_mutex.tryLock()) {
+        defer att.send_mutex.unlock(att.io);
+        att.ws.writeMessage(&taken_over_close, .connection_close) catch {};
+        return;
+    }
+    // 写线程正在发大块输出：清队列，把关闭帧排到最前面，最多等 200ms。
+    att.dropQueued();
+    att.sendRaw(&taken_over_close, .connection_close) catch return;
+    att.waitOutEmpty(200);
 }
 
 pub const Manager = struct {
@@ -92,7 +200,7 @@ pub const Manager = struct {
     }
 
     fn now(self: *Manager) i96 {
-        return Io.Clock.real.now(self.io).nanoseconds;
+        return Io.Clock.awake.now(self.io).nanoseconds;
     }
 
     /// attach 时不能无限等 session 锁：慢客户端可能让 pump 长时间卡在写 socket 上。
@@ -546,7 +654,7 @@ const Session = struct {
     cwd_valid: bool = false,
 
     fn now(self: *Session) i96 {
-        return Io.Clock.real.now(self.manager.io).nanoseconds;
+        return Io.Clock.awake.now(self.manager.io).nanoseconds;
     }
 
     fn appendLocked(self: *Session, data: []const u8) void {
@@ -758,7 +866,10 @@ pub fn serve(
     session_id: ?[16]u8,
     offset: u64,
 ) !void {
-    var att: Attachment = .{ .io = io, .ws = ws, .stream = stream };
+    var att: Attachment = .{ .io = io, .gpa = manager.gpa, .ws = ws, .stream = stream };
+    // 先启动写线程：attach 的 hello/回放也走队列，attach 本身不必等 socket。
+    try att.startWriter();
+    defer att.stopWriter();
 
     manager.attach(&att, session_id, offset) catch |err| {
         const body = switch (err) {
@@ -767,6 +878,7 @@ pub fn serve(
             error.PtySpawnFailed => "{\"t\":\"error\",\"reason\":\"pty_failed\"}",
             else => "{\"t\":\"error\"}",
         };
+        att.dropQueued();
         ws.writeMessage(body, .text) catch {};
         return err;
     };

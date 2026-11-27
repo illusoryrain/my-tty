@@ -140,6 +140,8 @@ const ROOT_NAME = path.basename(ROOT);
     null,
     { timeout: 8000 }
   );
+  // 等提示符输出稳定后再搜索，避免刚加上的 selection 被后续渲染清掉。
+  await page.waitForTimeout(300);
   await page.keyboard.press("Control+Shift+F");
   await page.waitForSelector("#find-bar:not([hidden])");
   await page.fill("#find-input", "FIND");

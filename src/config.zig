@@ -10,6 +10,9 @@ const net = std.Io.net;
 
 pub const default_config_path = "my-tty.json";
 
+/// 当前版本；发布时必须与 build.zig.zon 和 git tag 一致。
+pub const version = "0.1.1";
+
 pub const Config = struct {
     /// 监听地址。默认只绑回环：TLS 由外部反向代理终结，本进程不吃公网流量。
     host: []const u8 = "127.0.0.1",
@@ -38,6 +41,9 @@ pub const Config = struct {
         InvalidMaxSessions,
         InvalidHost,
         EmptyPassword,
+        WeakPassword,
+        InvalidShell,
+        ShellNotFound,
         InvalidSessionTtl,
         InvalidMaxConnections,
         InvalidPtyIdle,
@@ -56,6 +62,7 @@ pub const Config = struct {
         \\  --port <1-65535>     监听端口（默认 7387）
         \\  --shell <path>       登录 shell（默认 $SHELL 或 /bin/bash）
         \\  --password <secret>  登录密码；不填则每次启动随机生成
+        \\  --version            显示版本
         \\  --session-ttl-days <n>  登录有效期，默认 7 天
         \\  --session-idle-hours <n>  空闲超时，默认 24 小时（0 关闭）
         \\  --max-connections <n>  最大并发连接，默认 64
@@ -69,7 +76,7 @@ pub const Config = struct {
         \\    "host": "127.0.0.1",
         \\    "port": 7387,
         \\    "shell": "/bin/bash",
-        \\    "password": "change-me",
+        \\    "password": "replace-with-a-long-random-password",
         \\    "session_ttl_days": 7,
         \\    "session_idle_hours": 24,
         \\    "max_connections": 64,
@@ -166,6 +173,12 @@ pub const Config = struct {
             if (env.get("SHELL")) |v| cfg.shell = v;
         }
 
+        if (!std.fs.path.isAbsolute(cfg.shell)) return error.InvalidShell;
+        const shell_st = std.Io.Dir.cwd().statFile(init.io, cfg.shell, .{}) catch
+            return error.ShellNotFound;
+        if (shell_st.kind != .file or (shell_st.permissions.toMode() & 0o111) == 0)
+            return error.ShellNotFound;
+
         try cfg.validate();
         return cfg;
     }
@@ -177,6 +190,8 @@ pub const Config = struct {
         if (cfg.max_sessions == 0) return error.InvalidMaxSessions;
         if (cfg.password) |p| {
             if (p.len == 0) return error.EmptyPassword;
+            if (p.len < 8 or std.mem.eql(u8, p, "change-me") or std.mem.eql(u8, p, "password"))
+                return error.WeakPassword;
         }
         if (cfg.session_ttl_days == 0 or cfg.session_ttl_days > 365) return error.InvalidSessionTtl;
         if (cfg.session_idle_hours > 8760) return error.InvalidSessionTtl;

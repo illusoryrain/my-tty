@@ -23,10 +23,6 @@ pub const max_list_entries: usize = 10_000;
 pub const max_tar_entries: usize = 50_000;
 pub const max_tar_bytes: u64 = 8 * 1024 * 1024 * 1024;
 
-/// 上传临时文件只对当前用户可读写；完成后再改回普通文件权限。
-const upload_temp_mode: std.posix.mode_t = 0o600;
-const upload_final_mode: std.posix.mode_t = 0o644;
-
 const Entry = struct {
     name: []const u8,
     kind: []const u8,
@@ -66,12 +62,10 @@ pub fn handle(io: Io, gpa: Allocator, request: *http.Server.Request) !void {
         return delete(io, arena, request);
     }
     if (std.mem.eql(u8, path, "/api/fs/upload")) {
-        return switch (request.head.method) {
-            .PUT => upload(io, arena, request),
-            .GET => uploadStatus(io, arena, request),
-            .DELETE => uploadCancel(io, arena, request),
-            else => fail(request, arena, .method_not_allowed, "method_not_allowed"),
-        };
+        if (request.head.method != .PUT)
+            return fail(request, arena, .method_not_allowed, "method_not_allowed");
+        return uploadSingle(io, arena, normalized(arena, param(arena, request, "path")) catch
+            return fail(request, arena, .bad_request, "invalid_path"), request);
     }
     if (std.mem.eql(u8, path, "/api/fs/archive")) {
         if (request.head.method != .GET) return fail(request, arena, .method_not_allowed, "method_not_allowed");
@@ -115,13 +109,20 @@ fn list(io: Io, arena: Allocator, request: *http.Server.Request) !void {
             continue;
         }
         const name = arena.dupe(u8, entry.name) catch return fail(request, arena, .internal_server_error, "out_of_memory");
-        const size: u64 = if (entry.kind == .file) blk: {
-            const st = dir.statFile(io, entry.name, .{ .follow_symlinks = false }) catch break :blk 0;
-            break :blk st.size;
-        } else 0;
+        // 列表按链接指向的类型展示：指向文件的链接可以编辑，指向目录的可以展开。
+        var kind = entry.kind;
+        var size: u64 = 0;
+        if (entry.kind == .sym_link) {
+            if (dir.statFile(io, entry.name, .{ .follow_symlinks = true })) |st| {
+                kind = st.kind;
+                if (kind == .file) size = st.size;
+            } else |_| {}
+        } else if (entry.kind == .file) {
+            if (dir.statFile(io, entry.name, .{ .follow_symlinks = false })) |st| size = st.size else |_| {}
+        }
         entries.append(arena, .{
             .name = name,
-            .kind = @tagName(entry.kind),
+            .kind = @tagName(kind),
             .size = size,
         }) catch return fail(request, arena, .internal_server_error, "out_of_memory");
     }
@@ -185,6 +186,9 @@ fn write(io: Io, gpa: Allocator, arena: Allocator, request: *http.Server.Request
     if (rel.len == 0) return fail(request, arena, .bad_request, "invalid_path");
     // 读 body 之后 request.head（含 target）就失效了，所有 query 参数必须先取出来。
     const base = param(arena, request, "base");
+    const exclusive = std.mem.eql(u8, param(arena, request, "exclusive"), "1");
+    if (!util.requestDeclaresBody(request))
+        return fail(request, arena, .length_required, "length_required");
 
     if (request.head.content_length) |len| {
         if (len > max_write) return failClose(request, arena, .payload_too_large, "body_too_large");
@@ -200,19 +204,24 @@ fn write(io: Io, gpa: Allocator, arena: Allocator, request: *http.Server.Request
     // 客户端可能在 Content-Length 之前就断开；不能把半截内容写进目标文件。
     if (!util.bodyComplete(request)) return failClose(request, arena, .bad_request, "bad_body");
 
-    const abs = resolveNew(io, arena, rel) catch |err| return failMapped(request, arena, err);
+    const abs = resolveWriteTarget(io, arena, rel) catch |err| return failMapped(request, arena, err);
 
     const base_ok = baseMatches(io, arena, abs, base) catch |err| return failMapped(request, arena, err);
     if (!base_ok) return fail(request, arena, .conflict, "modified_on_disk");
 
     const perms = existingFilePermissions(io, abs) orelse .default_file;
     var atomic = Dir.cwd().createFileAtomic(io, abs, .{
-        .replace = true,
+        .replace = !exclusive,
         .permissions = perms,
     }) catch |err| return failMapped(request, arena, err);
     defer atomic.deinit(io);
+    atomic.file.setPermissions(io, perms) catch {};
     atomic.file.writeStreamingAll(io, body) catch |err| return failMapped(request, arena, err);
-    atomic.replace(io) catch |err| return failMapped(request, arena, err);
+    if (exclusive) {
+        atomic.link(io) catch |err| return failMapped(request, arena, err);
+    } else {
+        atomic.replace(io) catch |err| return failMapped(request, arena, err);
+    }
 
     var pb: [256]u8 = undefined;
     std.debug.print("写入 /{s} ({d} B)\n", .{ logText(&pb, rel), body.len });
@@ -248,12 +257,20 @@ fn rename(io: Io, arena: Allocator, request: *http.Server.Request) !void {
     const to_rel = normalized(arena, param(arena, request, "to")) catch
         return fail(request, arena, .bad_request, "invalid_path");
     if (from_rel.len == 0 or to_rel.len == 0) return fail(request, arena, .bad_request, "invalid_path");
+    const overwrite = std.mem.eql(u8, param(arena, request, "overwrite"), "1");
 
     const from_abs = resolveLeaf(io, arena, from_rel) catch |err| return failMapped(request, arena, err);
     const to_abs = resolveNew(io, arena, to_rel) catch |err| return failMapped(request, arena, err);
     if (std.mem.eql(u8, from_abs, "/")) return fail(request, arena, .forbidden, "cannot_move_root");
 
-    Dir.rename(.cwd(), from_abs, .cwd(), to_abs, io) catch |err| return failMapped(request, arena, err);
+    if (overwrite) {
+        Dir.rename(.cwd(), from_abs, .cwd(), to_abs, io) catch |err| return failMapped(request, arena, err);
+    } else {
+        Dir.renamePreserve(.cwd(), from_abs, .cwd(), to_abs, io) catch |err| return switch (err) {
+            error.PathAlreadyExists => fail(request, arena, .conflict, "already_exists"),
+            else => failMapped(request, arena, err),
+        };
+    }
 
     var fb: [256]u8 = undefined;
     var tb: [256]u8 = undefined;
@@ -285,36 +302,36 @@ fn delete(io: Io, arena: Allocator, request: *http.Server.Request) !void {
     return respondJson(request, arena, .ok, Payload{ .ok = true });
 }
 
-fn upload(io: Io, arena: Allocator, request: *http.Server.Request) !void {
-    const rel = normalized(arena, param(arena, request, "path")) catch
-        return fail(request, arena, .bad_request, "invalid_path");
-    if (rel.len == 0) return fail(request, arena, .bad_request, "invalid_path");
+fn parseU64(text: []const u8) ?u64 {
+    return std.fmt.parseInt(u64, text, 10) catch null;
+}
 
-    const raw_id = param(arena, request, "id");
-    if (raw_id.len != 0) {
-        const valid = validUploadId(raw_id) orelse
-            return fail(request, arena, .bad_request, "invalid_id");
-        return uploadChunk(io, arena, rel, valid, request);
-    }
-    return uploadSingle(io, arena, rel, request);
+fn failOffset(request: *http.Server.Request, alloc: Allocator, status: http.Status, code: []const u8, offset: u64) !void {
+    const Payload = struct { @"error": []const u8, offset: u64 };
+    return respondJson(request, alloc, status, Payload{ .@"error" = code, .offset = offset });
 }
 
 fn uploadSingle(io: Io, arena: Allocator, rel: []const u8, request: *http.Server.Request) !void {
+    if (!util.requestDeclaresBody(request))
+        return fail(request, arena, .length_required, "length_required");
     if (request.head.content_length) |len| {
         if (len > max_upload) return failClose(request, arena, .payload_too_large, "upload_too_large");
     }
 
-    const abs = resolveNew(io, arena, rel) catch |err| return failMapped(request, arena, err);
+    const abs = resolveWriteTarget(io, arena, rel) catch |err| return failMapped(request, arena, err);
 
-    const perms = existingFilePermissions(io, abs) orelse .default_file;
+    const existing_perms = existingFilePermissions(io, abs);
+    const perms = existing_perms orelse .default_file;
     var atomic = Dir.cwd().createFileAtomic(io, abs, .{
         .replace = true,
         .permissions = perms,
     }) catch |err| return failMapped(request, arena, err);
     defer atomic.deinit(io);
+    if (existing_perms != null) atomic.file.setPermissions(io, perms) catch {};
 
     var head_buf: [16 * 1024]u8 = undefined;
-    const body_reader = request.readerExpectContinue(&head_buf) catch return fail(request, arena, .bad_request, "bad_body");
+    const body_reader = request.readerExpectContinue(&head_buf) catch
+        return fail(request, arena, .bad_request, "bad_body");
 
     var chunk: [64 * 1024]u8 = undefined;
     var total: u64 = 0;
@@ -326,160 +343,14 @@ fn uploadSingle(io: Io, arena: Allocator, rel: []const u8, request: *http.Server
         atomic.file.writeStreamingAll(io, chunk[0..n]) catch |err| return failMapped(request, arena, err);
     }
 
-    // 同上：body 不完整时保留临时文件，不要覆盖目标文件。
     if (!util.bodyComplete(request)) return failClose(request, arena, .bad_request, "bad_body");
-
     atomic.replace(io) catch |err| return failMapped(request, arena, err);
 
     var pb: [256]u8 = undefined;
-    std.debug.print("上传 /{s} ({d} B)\n", .{ logText(&pb, rel), total });
+    std.debug.print("上传 /{s} ({d} B)\n", .{ util.logText(&pb, rel), total });
 
     const Payload = struct { ok: bool, done: bool, path: []const u8, offset: u64 };
     return respondJson(request, arena, .ok, Payload{ .ok = true, .done = true, .path = rel, .offset = total });
-}
-
-fn uploadChunk(io: Io, arena: Allocator, rel: []const u8, id: []const u8, request: *http.Server.Request) !void {
-    const offset = parseU64(param(arena, request, "offset")) orelse
-        return fail(request, arena, .bad_request, "invalid_offset");
-    const total = parseU64(param(arena, request, "total")) orelse
-        return fail(request, arena, .bad_request, "invalid_total");
-    if (total == 0 or total > max_upload) return failClose(request, arena, .payload_too_large, "upload_too_large");
-    if (offset > total) return failClose(request, arena, .bad_request, "invalid_offset");
-
-    const abs = resolveNew(io, arena, rel) catch |err| return failMapped(request, arena, err);
-    const temp = uploadTempPath(arena, abs, id) catch
-        return fail(request, arena, .internal_server_error, "out_of_memory");
-
-    var file: std.Io.File = undefined;
-    if (offset == 0) {
-        // 先删掉旧临时文件再独占创建：既避免复用上次的半截内容，也避免
-        // open(O_TRUNC) 跟随攻击者预先放在这里的符号链接写到 root 之外。
-        Dir.cwd().deleteFile(io, temp) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return failMapped(request, arena, err),
-        };
-        // 半截文件只有本用户可以读写，避免多用户机器上被其他本地用户读到。
-        file = Dir.cwd().createFile(io, temp, .{
-            .truncate = true,
-            .exclusive = true,
-            .permissions = .fromMode(upload_temp_mode),
-        }) catch |err| return failMapped(request, arena, err);
-    } else {
-        file = Dir.cwd().openFile(io, temp, .{ .mode = .read_write, .follow_symlinks = false }) catch |err| switch (err) {
-            error.FileNotFound => return failOffset(request, arena, .conflict, "offset_mismatch", 0),
-            else => return failMapped(request, arena, err),
-        };
-        const st = file.stat(io) catch |err| {
-            file.close(io);
-            return failMapped(request, arena, err);
-        };
-        if (st.size != offset) {
-            file.close(io);
-            return failOffset(request, arena, .conflict, "offset_mismatch", st.size);
-        }
-    }
-
-    var closed = false;
-    defer if (!closed) file.close(io);
-
-    var write_buf: [64 * 1024]u8 = undefined;
-    var fw = file.writer(io, &write_buf);
-    fw.seekTo(offset) catch |err| return failMapped(request, arena, err);
-
-    var head_buf: [16 * 1024]u8 = undefined;
-    const body_reader = request.readerExpectContinue(&head_buf) catch return fail(request, arena, .bad_request, "bad_body");
-
-    var chunk: [64 * 1024]u8 = undefined;
-    var written: u64 = offset;
-    while (true) {
-        const n = body_reader.readSliceShort(&chunk) catch |err| return failMapped(request, arena, err);
-        if (n == 0) break;
-        written += n;
-        if (written > total) return fail(request, arena, .payload_too_large, "upload_too_large");
-        fw.interface.writeAll(chunk[0..n]) catch |err| return failMapped(request, arena, err);
-    }
-    fw.interface.flush() catch |err| return failMapped(request, arena, err);
-
-    // 完整写入后改回普通文件权限再 rename；未完成的半截文件保持 0600。
-    // 用 fd 上的 chmod，不经过路径，因此不受符号链接替换影响。
-    if (written == total) {
-        const perms = existingFilePermissions(io, abs) orelse std.Io.File.Permissions.fromMode(upload_final_mode);
-        file.setPermissions(io, perms) catch {};
-    }
-
-    file.close(io);
-    closed = true;
-
-    if (written < total) {
-        const Payload = struct { ok: bool, done: bool, offset: u64 };
-        return respondJson(request, arena, .ok, Payload{ .ok = true, .done = false, .offset = written });
-    }
-
-    Dir.rename(.cwd(), temp, .cwd(), abs, io) catch |err| return failMapped(request, arena, err);
-
-    var pb: [256]u8 = undefined;
-    std.debug.print("上传 /{s} ({d} B)\n", .{ logText(&pb, rel), total });
-
-    const Payload = struct { ok: bool, done: bool, path: []const u8, offset: u64 };
-    return respondJson(request, arena, .ok, Payload{ .ok = true, .done = true, .path = rel, .offset = total });
-}
-
-fn uploadStatus(io: Io, arena: Allocator, request: *http.Server.Request) !void {
-    const rel = normalized(arena, param(arena, request, "path")) catch
-        return fail(request, arena, .bad_request, "invalid_path");
-    if (rel.len == 0) return fail(request, arena, .bad_request, "invalid_path");
-    const raw_id = param(arena, request, "id");
-    if (raw_id.len == 0) return fail(request, arena, .bad_request, "invalid_id");
-    const id = validUploadId(raw_id) orelse return fail(request, arena, .bad_request, "invalid_id");
-    const abs = resolveNew(io, arena, rel) catch |err| return failMapped(request, arena, err);
-    const temp = uploadTempPath(arena, abs, id) catch
-        return fail(request, arena, .internal_server_error, "out_of_memory");
-
-    const st = Dir.cwd().statFile(io, temp, .{ .follow_symlinks = false }) catch |err| switch (err) {
-        error.FileNotFound => null,
-        else => return failMapped(request, arena, err),
-    };
-    const Payload = struct { offset: u64 };
-    return respondJson(request, arena, .ok, Payload{ .offset = if (st) |x| x.size else 0 });
-}
-
-fn uploadCancel(io: Io, arena: Allocator, request: *http.Server.Request) !void {
-    const rel = normalized(arena, param(arena, request, "path")) catch
-        return fail(request, arena, .bad_request, "invalid_path");
-    if (rel.len == 0) return fail(request, arena, .bad_request, "invalid_path");
-    const raw_id = param(arena, request, "id");
-    if (raw_id.len == 0) return fail(request, arena, .bad_request, "invalid_id");
-    const id = validUploadId(raw_id) orelse return fail(request, arena, .bad_request, "invalid_id");
-    const abs = resolveNew(io, arena, rel) catch |err| return failMapped(request, arena, err);
-    const temp = uploadTempPath(arena, abs, id) catch
-        return fail(request, arena, .internal_server_error, "out_of_memory");
-
-    Dir.cwd().deleteFile(io, temp) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return failMapped(request, arena, err),
-    };
-    const Payload = struct { ok: bool };
-    return respondJson(request, arena, .ok, Payload{ .ok = true });
-}
-
-fn validUploadId(raw: []const u8) ?[]const u8 {
-    if (raw.len < 8 or raw.len > 32) return null;
-    for (raw) |c| if (!std.ascii.isHex(c)) return null;
-    return raw;
-}
-
-fn uploadTempPath(alloc: Allocator, target_abs: []const u8, id: []const u8) ![]const u8 {
-    const slash = std.mem.lastIndexOfScalar(u8, target_abs, '/') orelse return error.InvalidPath;
-    return std.fmt.allocPrint(alloc, "{s}/.myty-upload-{s}", .{ target_abs[0..slash], id });
-}
-
-fn parseU64(text: []const u8) ?u64 {
-    return std.fmt.parseInt(u64, text, 10) catch null;
-}
-
-fn failOffset(request: *http.Server.Request, alloc: Allocator, status: http.Status, code: []const u8, offset: u64) !void {
-    const Payload = struct { @"error": []const u8, offset: u64 };
-    return respondJson(request, alloc, status, Payload{ .@"error" = code, .offset = offset });
 }
 
 fn archive(io: Io, arena: Allocator, request: *http.Server.Request) !void {
@@ -743,6 +614,14 @@ fn resolveNew(io: Io, alloc: Allocator, rel: []const u8) PathError![]const u8 {
     return joinAbs(alloc, parent, base);
 }
 
+/// 写入目标：目标是符号链接时写到它指向的真实文件，避免替换链接本身。
+fn resolveWriteTarget(io: Io, alloc: Allocator, rel: []const u8) PathError![]const u8 {
+    return resolveExisting(io, alloc, rel) catch |err| switch (err) {
+        error.FileNotFound => resolveNew(io, alloc, rel),
+        else => err,
+    };
+}
+
 /// 只规范化父目录，不解析最后一段。delete/rename 用它来操作符号链接本身，
 /// 而不是把链接解析到目标，避免“删除一个链接却删掉整个目标目录”。
 fn resolveLeaf(io: Io, alloc: Allocator, rel: []const u8) PathError![]const u8 {
@@ -890,23 +769,6 @@ test "content disposition encoding" {
     var buf2: [256]u8 = undefined;
     const cjk = contentDisposition(&buf2, "\u{4e2d}\u{6587}.txt");
     try std.testing.expect(std.mem.indexOf(u8, cjk, "filename*=UTF-8''%E4%B8%AD%E6%96%87.txt") != null);
-}
-
-test "upload id validation" {
-    try std.testing.expect(validUploadId("abcdef0123456789") != null);
-    try std.testing.expect(validUploadId("abcdef") == null);
-    try std.testing.expect(validUploadId("zzzzzzzz") == null);
-    try std.testing.expect(validUploadId("0123456789abcdef0123456789abcdef0") == null);
-}
-
-test "upload temp path stays beside the target" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const a = arena_state.allocator();
-    try std.testing.expectEqualStrings(
-        "/srv/work/dir/.myty-upload-abcdef01",
-        try uploadTempPath(a, "/srv/work/dir/file.txt", "abcdef01"),
-    );
 }
 
 test "basename" {

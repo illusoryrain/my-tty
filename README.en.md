@@ -25,7 +25,7 @@ Status:
 ```sh
 zig build                    # Debug: debug info, large; local debugging only
 zig test src/tests.zig
-./zig-out/bin/my-tty --port 7387 --password 'change-me'
+./zig-out/bin/my-tty --port 7387 --password 'my-tty-please-change-this'
 # open http://127.0.0.1:7387/ and enter the password in the dialog
 
 ./scripts/build-release.sh                # release: ReleaseSafe + strip, ~1.4 MiB
@@ -60,7 +60,7 @@ terminal; it changes on restart.
 Choose a shell:
 
 ```sh
-./zig-out/bin/my-tty --shell /bin/zsh --password 'change-me'
+./zig-out/bin/my-tty --shell /bin/zsh --password 'my-tty-please-change-this'
 ```
 
 The shell inside the terminal is a **login shell**: its home directory and identity
@@ -82,7 +82,7 @@ Reads `./my-tty.json` by default (skipped if missing).
   "host": "127.0.0.1",
   "port": 7387,
   "shell": "/bin/bash",
-  "password": "please-change-me",
+  "password": "replace-with-a-long-random-password",
   "session_ttl_days": 7,
   "session_idle_hours": 24,
   "max_connections": 64,
@@ -96,6 +96,18 @@ Environment variables: `MYTTY_CONFIG`, `MYTTY_HOST`, `MYTTY_PORT`, `MYTTY_SHELL`
 `MYTTY_MAX_CONNECTIONS`, `MYTTY_MAX_SESSIONS`, `MYTTY_PTY_IDLE_MINUTES`.
 See `my-tty --help` for all options; the repo includes `my-tty.example.json`.
 `my-tty --check-config` validates the config and exits without starting the server.
+
+## Verify a release
+
+Download the archive for your architecture plus `SHA256SUMS` from GitHub Releases,
+then verify before extracting:
+
+```sh
+sha256sum -c SHA256SUMS --ignore-missing
+tar -xzf my-tty-<version>-<arch>-linux.tar.gz
+```
+
+`my-tty --version` must match the release tag.
 
 ## As a systemd service
 

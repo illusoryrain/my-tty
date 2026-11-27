@@ -139,7 +139,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     page.waitForEvent("download"),
     dirRow.locator('button[title="下载目录（tar）"]').click(),
   ]);
-  const tarPath = path.join(os.tmpdir(), "my-tty-arch.tar");
+  const tarPath = path.join(ROOT, "my-tty-arch.tar");
   await tar.saveAs(tarPath);
   assert(fs.statSync(tarPath).size > 512, "tar downloaded");
   assert(tar.suggestedFilename() === "arch.tar", "tar filename");

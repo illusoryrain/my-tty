@@ -35,6 +35,8 @@ pub fn contentVersion(body: []const u8) [16]u8 {
 /// 所有响应共用的安全头。API 和静态资源都带上，避免两套路由逐渐走偏。
 /// `Accept-Encoding` 是否接受 gzip（忽略 q 值，只要出现 gzip 就当作可以）。
 pub fn acceptsGzip(request: *const http.Server.Request) bool {
+    // body 读完后 head buffer 已失效；std 的 iterateHeaders 会断言。
+    if (request.server.reader.state != .received_head) return false;
     var it = request.iterateHeaders();
     while (it.next()) |header| {
         if (!std.ascii.eqlIgnoreCase(header.name, "accept-encoding")) continue;
@@ -55,11 +57,17 @@ pub const security_headers = [_]http.Header{
     .{ .name = "content-security-policy", .value = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' ws: wss:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'" },
 };
 
-/// 请求是否声明了 body（Transfer-Encoding 或非 0 Content-Length）。
-pub fn requestHasBody(request: *const http.Server.Request) bool {
+/// 请求是否声明了 body（Transfer-Encoding 或 Content-Length，允许 0）。
+pub fn requestDeclaresBody(request: *const http.Server.Request) bool {
     if (request.head.transfer_encoding != .none) return true;
-    if (request.head.content_length) |len| return len != 0;
-    return false;
+    return request.head.content_length != null;
+}
+
+/// 请求是否真的带非空 body。
+pub fn requestHasBody(request: *const http.Server.Request) bool {
+    if (!requestDeclaresBody(request)) return false;
+    if (request.head.transfer_encoding != .none) return true;
+    return (request.head.content_length orelse 0) != 0;
 }
 
 /// body 是否已经被完整读走；没读完就不能复用这条连接。
@@ -73,6 +81,13 @@ pub fn bodyComplete(request: *const http.Server.Request) bool {
 pub fn pathOnly(target: []const u8) []const u8 {
     const end = std.mem.indexOfAny(u8, target, "?#") orelse target.len;
     return target[0..end];
+}
+
+/// 写日志前把控制字符替换掉，防止请求路径里的换行伪造 journal 行。
+pub fn logText(buf: []u8, raw: []const u8) []const u8 {
+    const n = @min(raw.len, buf.len);
+    for (raw[0..n], 0..) |c, i| buf[i] = if (c < 0x20 or c == 0x7f) '?' else c;
+    return buf[0..n];
 }
 
 pub const DecodeError = error{ InvalidEncoding, OutOfMemory };

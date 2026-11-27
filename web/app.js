@@ -297,8 +297,18 @@
     createPane("", tab);
   }
 
+  function focusActive() {
+    if (!activeTab) return;
+    if (activeTab.kind === "editor" && activeTab.editor) activeTab.editor.textarea.focus();
+    else if (activePane) activePane.term.focus();
+  }
+
   function activateTab(tab) {
-    if (!tab || tab === activeTab) return;
+    if (!tab) return;
+    if (tab === activeTab) {
+      focusActive();
+      return;
+    }
 
     if (activeTab) {
       if (activeTab.kind === "terminal") {
@@ -352,8 +362,9 @@
   }
 
   async function closeTab(tab) {
-    const idx = tabs.indexOf(tab);
-    if (idx === -1) return;
+    if (!tab || tab.closing) return;
+    tab.closing = true;
+    if (!tabs.includes(tab)) return;
     if (tab.kind === "editor" && tab.editor && tab.editor.dirty) {
       const ok = await askConfirm(
         "放弃未保存的修改？",
@@ -361,8 +372,13 @@
         "放弃并关闭",
         true
       );
-      if (!ok) return;
+      if (!ok) {
+        tab.closing = false;
+        return;
+      }
     }
+    const idx = tabs.indexOf(tab);
+    if (idx === -1) return;
 
     if (tab.kind === "terminal") {
       for (const pane of [...tab.panes]) removePane(pane, false);
@@ -384,6 +400,7 @@
     updateTabHint();
     layoutTabs();
     saveSessions();
+    if (activeTab) focusActive();
   }
 
   // ---------------------------------------------------------------- terminals
@@ -612,10 +629,8 @@
       retryTimer: null,
       retryAttempt: 0,
       retryable: true,
+      authStopped: false,
       opens: 0,
-      // connectPane 在等 ticket 时 pane.ws 还是空的；没有这个标记，online /
-      // visibilitychange 会在同一分屏上再取一张票，建出第二条 WebSocket。
-      connecting: false,
       // 终端输出写队列：xterm 还在解析上一批时到达的帧先攒起来，下一批合成一次 write。
       outQueue: [],
       outQueued: 0,
@@ -717,6 +732,7 @@
           tabs: termTabs.map((t) => ({
             x: t.splitX,
             y: t.splitY,
+            a: Math.max(0, t.panes.indexOf(t.activePane)),
             s: t.panes.map((p) => p.sessionId || ""),
           })),
         })
@@ -724,7 +740,11 @@
     } catch (_) {}
   }
 
-  async function connectPane(pane) {
+  function markAuthStopped() {
+    for (const t of tabs) for (const p of t.panes) p.authStopped = true;
+  }
+
+  function connectPane(pane) {
     if (!pane.el.isConnected) return;
     if (pane.retryTimer) {
       clearTimeout(pane.retryTimer);
@@ -734,74 +754,43 @@
     if (current && (current.readyState === WebSocket.OPEN || current.readyState === WebSocket.CONNECTING)) {
       return;
     }
-    // 票据请求是异步的；这段窗口里 pane.ws 仍为空，必须靠标记挡住重入，
-    // 否则 online/可见性变化会为同一个分屏建出两条 WebSocket（甚至两个 PTY）。
-    if (pane.connecting) return;
-    pane.connecting = true;
     setPaneStatus(pane, "连接中…", "pending");
     pane.reconnect = () => connectPane(pane);
 
-    let ticket = "";
-    try {
-      const res = await fetch("/api/auth/ticket", { method: "POST", cache: "no-store" });
-      if (!res.ok) {
-        pane.connecting = false;
-        if (res.status === 401) {
-          // 登录真的失效了：停止自动重连，登录成功后 startApp 会统一重试。
-          pane.retryable = false;
-          showLogin("登录已失效，请重新登录");
-          setPaneStatus(pane, "认证失败（点击重试）", "error");
-        } else {
-          setPaneStatus(pane, "无法获取连接票据", "error");
-          scheduleReconnect(pane);
-        }
-        return;
-      }
-      ticket = (await res.json()).ticket || "";
-    } catch (err) {
-      // 网络问题不等于登录失效：不弹登录框，安静退避重试。
-      pane.connecting = false;
-      setPaneStatus(pane, "无法获取连接票据", "error");
-      scheduleReconnect(pane);
-      return;
-    }
-
-    // pane 可能在等待 ticket 时被关闭，或所在标签页被删掉。
-    if (!pane.el.isConnected) {
-      pane.connecting = false;
-      return;
-    }
-
-    let url = `${wsBase}?ticket=${encodeURIComponent(ticket)}&offset=${pane.offset}`;
+    // 浏览器会在同源 WebSocket 握手里自动带 HttpOnly Cookie，把票据从 URL
+    // 里去掉，代理日志和网络抓包就看不到任何可用凭据。
+    let url = `${wsBase}?offset=${pane.offset}`;
     if (pane.sessionId) url += `&session=${encodeURIComponent(pane.sessionId)}`;
 
     let ws;
     try {
       ws = new WebSocket(url);
     } catch (err) {
-      pane.connecting = false;
       scheduleReconnect(pane);
       return;
     }
     ws.binaryType = "arraybuffer";
     pane.ws = ws;
-    pane.connecting = false;
     pane.reconnect = () => connectPane(pane);
 
     ws.onopen = () => {
+      if (pane.ws !== ws) return;
       pane.alive = true;
+      pane.authStopped = false;
       pane.opens += 1;
       pane.retryAttempt = 0;
       pane.retryable = true;
       startHeartbeat(pane);
       setPaneStatus(pane, "已连接", "ok");
       fitPane(pane);
-      // 点击状态栏重连后把焦点还给终端，否则接下来的按键会落到 body 上；
-      // 后台标签页连上时不能把用户切走。
-      if (pane.tab === activeTab) focusPane(pane);
+      // 自动重连不能抢焦点/切活动分屏；只有本来就是当前分屏、且没有弹窗时才恢复焦点。
+      if (pane.tab === activeTab && activePane === pane && promptOverlay.hidden && loginOverlay.hidden) {
+        pane.term.focus();
+      }
       updateSummary();
     };
     ws.onmessage = (event) => {
+      if (pane.ws !== ws) return;
       pane.lastRx = Date.now();
       if (typeof event.data !== "string") {
         const bytes = new Uint8Array(event.data);
@@ -851,7 +840,7 @@
         );
       }
     };
-    ws.onclose = (event) => {
+    ws.onclose = async (event) => {
       if (pane.ws !== ws) return; // 已经有新连接接管这个 pane，别动它的心跳
       stopHeartbeat(pane);
       pane.ws = null;
@@ -865,6 +854,18 @@
         return;
       }
       if (!pane.el.isConnected || !started) return;
+      // WebSocket 握手 401 在浏览器里只会变成 1006；用状态接口区分“掉线”和
+      // “登录过期”，避免过期后无限重连。
+      try {
+        const res = await fetch("/api/auth/status", { cache: "no-store" });
+        if (res.status === 401) {
+          markAuthStopped();
+          stopAuthKeepalive();
+          showLogin("登录已失效，请重新登录");
+          return;
+        }
+      } catch (_) {}
+      if (!started || !pane.el.isConnected) return;
       if (pane.retryable) {
         scheduleReconnect(pane);
       } else if (pane.status.textContent === "连接中…" || pane.status.textContent === "已连接") {
@@ -872,6 +873,7 @@
       }
     };
     ws.onerror = () => {
+      if (pane.ws !== ws) return;
       if (!pane.alive) setPaneStatus(pane, "连接被拒绝", "error");
     };
   }
@@ -1000,7 +1002,8 @@
   function retryDeadPanes() {
     for (const tab of tabs) {
       for (const pane of tab.panes) {
-        if (pane.alive || !pane.el.isConnected) continue;
+        if (pane.alive || !pane.el.isConnected || !pane.authStopped) continue;
+        pane.authStopped = false;
         pane.retryable = true;
         pane.retryAttempt = 0;
         if (pane.retryTimer) {
@@ -1097,11 +1100,15 @@
   function updateSummary() {
     if (activeTab && activeTab.kind === "editor") {
       const ed = activeTab.editor;
+      keysBar.hidden = true;
+      interruptBtn.disabled = true;
       statusEl.textContent = ed ? (ed.dirty ? `${ed.name} · 未保存` : ed.name) : "文件";
       statusEl.title = ed ? ed.path : "";
       statusEl.className = ed && ed.dirty ? "pending" : "";
       return;
     }
+    keysBar.hidden = false;
+    interruptBtn.disabled = false;
     const total = panes.length;
     const alive = panes.filter((p) => p.alive).length;
     // 全部正常时只显示“已连接”；只有分屏掉线时才显示 alive/total，
@@ -1370,6 +1377,12 @@
       openFind();
       return false;
     }
+    if (event.key === "F3") {
+      consumeKey(event);
+      if (findBar.hidden) openFind();
+      else runFind(event.shiftKey, false);
+      return false;
+    }
     return true;
   }
 
@@ -1385,6 +1398,7 @@
       data = await res.json();
     } catch (_) {}
     if (res.status === 401) {
+      markAuthStopped();
       showLogin("登录已失效，请重新登录");
       throw new Error("unauthorized");
     }
@@ -1459,7 +1473,6 @@
   /// 就会重新拉取十几份列表（可能几 MB JSON）。终端里的 cwd 变化已经由
   /// applyDir(force) 处理，这里只需要覆盖 UI 操作真正影响到的目录。
   async function refreshFiles(touched) {
-    notice("");
     const dirs = new Set(["", currentDir]);
     for (const dir of touched || []) {
       if (typeof dir === "string") dirs.add(dir);
@@ -1919,11 +1932,33 @@
     const newPath = joinPath(parentPath, next);
     try {
       await api("POST", "rename", { from: path, to: newPath });
-      if (isDir) rebaseTree(path, newPath);
-      refreshFiles([parentPath]);
     } catch (err) {
-      notice(`重命名失败: ${err.message}`, true);
+      if (err.code !== "already_exists") {
+        notice(`重命名失败: ${err.message}`, true);
+        return;
+      }
+      if (!(await askConfirm("目标已存在", `${newPath} 已存在，要覆盖吗？`, "覆盖", true))) return;
+      try {
+        await api("POST", "rename", { from: path, to: newPath, overwrite: "1" });
+      } catch (err2) {
+        notice(`重命名失败: ${err2.message}`, true);
+        return;
+      }
     }
+    if (isDir) rebaseTree(path, newPath);
+    for (const tab of tabs) {
+      if (tab.kind !== "editor" || !tab.editor) continue;
+      const old = tab.editor.path;
+      if (old !== path && !(isDir && old.startsWith(`${path}/`))) continue;
+      const moved = newPath + old.slice(path.length);
+      tab.editor.path = moved;
+      tab.editor.name = baseName(moved);
+      tab.editor.pathEl.textContent = moved;
+      tab.editor.pathEl.title = moved;
+      tab.label.textContent = tab.editor.name;
+      tab.label.title = moved;
+    }
+    refreshFiles([parentPath]);
   }
 
   async function deleteEntry(path, name, isDir) {
@@ -1932,6 +1967,11 @@
     try {
       await api("DELETE", "delete", { path });
       if (isDir) dropTreePath(path);
+      for (const tab of [...tabs]) {
+        if (tab.kind !== "editor" || !tab.editor) continue;
+        const p = tab.editor.path;
+        if (p === path || (isDir && p.startsWith(`${path}/`))) await closeTab(tab);
+      }
       refreshFiles([parentPath]);
     } catch (err) {
       notice(`删除失败: ${err.message}`, true);
@@ -2020,13 +2060,6 @@
   }
 
   const upload_limit = 64 * 1024 * 1024;
-  const upload_chunk = 4 * 1024 * 1024;
-
-  function randomUploadId() {
-    const bytes = new Uint8Array(8);
-    crypto.getRandomValues(bytes);
-    return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
-  }
 
   function showUploadProgress(show, fraction, text) {
     uploadProgress.hidden = !show;
@@ -2035,117 +2068,83 @@
     uprogText.textContent = text;
   }
 
-  function putChunk(url, blob, onProgress) {
+  // 整文件一次 PUT：服务端写临时文件后原子替换，断线不会留下半截目标文件。
+  function uploadOne(file, targetDir, batch) {
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
-      uploader = { xhr, cancelled: false, url };
+      const url = `/api/fs/upload?path=${encodeURIComponent(joinPath(targetDir, file.name))}`;
+      batch.xhr = xhr;
       xhr.open("PUT", url);
       xhr.responseType = "text";
       xhr.upload.onprogress = (ev) => {
-        if (ev.lengthComputable) onProgress(ev.loaded);
+        if (!ev.lengthComputable) return;
+        const pct = Math.round((ev.loaded / file.size) * 100);
+        showUploadProgress(true, ev.loaded / file.size, `${file.name} ${pct}%`);
       };
       xhr.onload = () => {
         let data = {};
         try {
           data = JSON.parse(xhr.responseText || "{}");
         } catch (_) {}
-        if (xhr.status >= 200 && xhr.status < 300) resolve(data);
-        else if (xhr.status === 401) reject(new Error("unauthorized"));
-        else reject(new Error(data.error || `HTTP ${xhr.status}`));
+        if (xhr.status >= 200 && xhr.status < 300) return resolve(data);
+        if (xhr.status === 401) {
+          showLogin("登录已失效，请重新登录");
+          return reject(new Error("unauthorized"));
+        }
+        reject(new Error(data.error || `HTTP ${xhr.status}`));
       };
       xhr.onerror = () => reject(new Error("network"));
       xhr.onabort = () => reject(new Error("cancelled"));
-      xhr.send(blob);
+      xhr.send(file);
     });
-  }
-
-  async function uploadOne(file, targetDir) {
-    const path = joinPath(targetDir, file.name);
-    const encoded = encodeURIComponent(path);
-    const total = file.size;
-
-    if (total === 0) {
-      const res = await fetch(`/api/fs/upload?path=${encoded}`, { method: "PUT", body: new Blob([]) });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return;
-    }
-
-    const id = randomUploadId();
-    let offset = 0;
-    let retries = 0;
-
-    while (offset < total) {
-      const end = Math.min(offset + upload_chunk, total);
-      const blob = file.slice(offset, end);
-      const url =
-        `/api/fs/upload?path=${encoded}&id=${id}&offset=${offset}&total=${total}`;
-      try {
-        const data = await putChunk(url, blob, (loaded) => {
-          showUploadProgress(
-            true,
-            (offset + loaded) / total,
-            `${file.name} ${Math.round(((offset + loaded) / total) * 100)}%`
-          );
-        });
-        offset = typeof data.offset === "number" ? data.offset : end;
-        retries = 0;
-      } catch (err) {
-        if (uploader && uploader.cancelled) throw err;
-        if (err.message === "unauthorized") {
-          showLogin("登录已失效，请重新登录");
-          throw err;
-        }
-        retries++;
-        if (retries > 3) throw err;
-        // 断点续传：向服务端确认已经写入的偏移量。
-        try {
-          const res = await fetch(`/api/fs/upload?path=${encoded}&id=${id}`, { method: "GET" });
-          if (res.ok) {
-            const data = await res.json();
-            offset = data.offset || 0;
-          }
-        } catch (_) {}
-      }
-    }
   }
 
   async function uploadFiles(fileList, targetDir = currentDir) {
     const files = Array.from(fileList || []);
     if (files.length === 0) return;
+    if (uploader) {
+      notice("已有一个上传任务在进行", true);
+      return;
+    }
 
+    const batch = { xhr: null, cancelled: false };
+    uploader = batch;
     let done = 0;
     let failed = 0;
     showUploadProgress(true, 0, "准备上传…");
 
-    for (const file of files) {
-      if (file.size > upload_limit) {
-        failed++;
-        notice(`${file.name} 超过 64 MiB 上限`, true);
-        continue;
-      }
-      try {
-        await uploadOne(file, targetDir);
-        done++;
-      } catch (err) {
-        failed++;
-        if (err.message !== "cancelled") {
-          notice(`上传 ${file.name} 失败: ${err.message}`, true);
+    try {
+      for (const file of files) {
+        if (batch.cancelled) break;
+        if (file.size > upload_limit) {
+          failed++;
+          notice(`${file.name} 超过 64 MiB 上限`, true);
+          continue;
         }
-        if (uploader && uploader.cancelled) break;
+        try {
+          await uploadOne(file, targetDir, batch);
+          done++;
+        } catch (err) {
+          failed++;
+          if (err.message !== "cancelled") notice(`上传 ${file.name} 失败: ${err.message}`, true);
+          if (batch.cancelled) break;
+        }
       }
+    } finally {
+      uploader = null;
+      showUploadProgress(false, 0, "");
+      if (batch.cancelled) notice("上传已取消", true);
+      else if (failed === 0) notice(`已上传 ${done} 个文件`);
+      else if (done > 0) notice(`上传完成 ${done} 个，失败 ${failed} 个`, true);
+      if (targetDir) treeExpanded.add(targetDir);
+      refreshFiles([targetDir]);
     }
-
-    showUploadProgress(false, 0, "");
-    uploader = null;
-    if (failed === 0) notice(`已上传 ${done} 个文件`);
-    else if (done > 0) notice(`上传完成 ${done} 个，失败 ${failed} 个`, true);
-    if (targetDir) treeExpanded.add(targetDir);
-    refreshFiles([targetDir]);
   }
 
   // 应用内文本输入弹窗；返回 null 表示取消。
   function askText(title, initial = "") {
     return new Promise((resolve) => {
+      const previous = document.activeElement;
       promptTitle.textContent = title;
       promptMessage.hidden = true;
       promptInput.hidden = false;
@@ -2162,6 +2161,7 @@
         promptForm.removeEventListener("submit", onSubmit);
         promptForm.removeEventListener("keydown", onKey);
         promptCancel.removeEventListener("click", onCancel);
+        if (previous instanceof HTMLElement && previous.isConnected) previous.focus();
         resolve(value);
       };
       const onSubmit = (event) => {
@@ -2192,6 +2192,7 @@
   // 返回 true 表示确认。
   function askConfirm(title, message, okLabel = "确定", danger = false) {
     return new Promise((resolve) => {
+      const previous = document.activeElement;
       promptTitle.textContent = title;
       promptMessage.textContent = message;
       promptMessage.hidden = !message;
@@ -2211,6 +2212,7 @@
         promptForm.removeEventListener("submit", onSubmit);
         promptForm.removeEventListener("keydown", onKey);
         promptCancel.removeEventListener("click", onCancel);
+        if (previous instanceof HTMLElement && previous.isConnected) previous.focus();
         resolve(value);
       };
       const onSubmit = (event) => {
@@ -2237,12 +2239,22 @@
     if (!name) return;
     const path = joinPath(currentDir, name);
     try {
-      await api("PUT", "write", { path }, "");
-      await refreshFiles();
-      openEditor(path);
+      await api("PUT", "write", { path, exclusive: "1" }, "");
     } catch (err) {
-      notice(`新建失败: ${err.message}`, true);
+      if (err.code !== "already_exists") {
+        notice(`新建失败: ${err.message}`, true);
+        return;
+      }
+      if (!(await askConfirm("文件已存在", `${path} 已存在，要覆盖吗？`, "覆盖", true))) return;
+      try {
+        await api("PUT", "write", { path }, "");
+      } catch (err2) {
+        notice(`新建失败: ${err2.message}`, true);
+        return;
+      }
     }
+    await refreshFiles();
+    openEditor(path);
   }
 
   async function newDir() {
@@ -2280,7 +2292,7 @@
       </header>
       <div class="editor-body">
         <pre class="editor-gutter" aria-hidden="true"></pre>
-        <textarea class="editor-text" spellcheck="false" autocomplete="off" autocapitalize="off" readonly></textarea>
+        <textarea class="editor-text" wrap="off" spellcheck="false" autocomplete="off" autocapitalize="off" readonly></textarea>
       </div>`;
     tab.el.appendChild(el);
 
@@ -2295,9 +2307,13 @@
     const ed = {
       path,
       name: baseName(path),
+      pathEl,
       version: "",
+      eol: "\n",
       dirty: false,
       loaded: false,
+      saving: false,
+      queued: false,
       textarea,
       gutter,
       stateEl,
@@ -2365,6 +2381,10 @@
     }
     const ed = buildEditorTab(tab, path);
     activateTab(tab);
+    if (window.matchMedia("(max-width: 820px)").matches) {
+      filesEl.hidden = true;
+      filesResizeEl.hidden = true;
+    }
 
     let data;
     try {
@@ -2379,7 +2399,9 @@
 
     // version 是服务端给的内容哈希；保存时带回去，文件在此期间被改过就会被拒绝。
     ed.version = data.version || "";
-    ed.textarea.value = data.content;
+    const raw = data.content;
+    ed.eol = raw.includes("\r\n") ? "\r\n" : raw.includes("\r") && !raw.includes("\n") ? "\r" : "\n";
+    ed.textarea.value = ed.eol === "\n" ? raw : raw.replace(/\r\n?/g, "\n");
     ed.textarea.readOnly = false;
     ed.loaded = true;
     setEditorState(tab, `${data.size} 字节 · 未修改`);
@@ -2393,15 +2415,28 @@
   async function saveEditor(tab, force = false) {
     const ed = tab && tab.editor;
     if (!ed || !ed.loaded) return;
+    if (ed.saving) {
+      ed.queued = true;
+      return;
+    }
+    if (!ed.dirty && !force) {
+      notice("没有修改");
+      return;
+    }
+
+    ed.saving = true;
+    ed.saveBtn.disabled = true;
+    let retryForce = false;
     const query = { path: ed.path };
     if (!force && ed.version) query.base = ed.version;
-    const text = ed.textarea.value;
+    const normalized = ed.textarea.value;
+    const text = ed.eol === "\n" ? normalized : normalized.replace(/\n/g, ed.eol);
+
     try {
       const res = await api("PUT", "write", query, text);
       if (tab.editor !== ed || !tabs.includes(tab)) return;
       ed.version = res.version || "";
-      // 保存请求在路上时用户可能又敲了字：那部分仍算未保存。
-      ed.dirty = ed.textarea.value !== text;
+      ed.dirty = ed.textarea.value !== normalized;
       setEditorState(tab, ed.dirty ? "未保存的修改" : `${res.size} 字节 · 已保存`);
       notice(`已保存 ${ed.path}`);
       refreshFiles([parentOf(ed.path)]);
@@ -2409,18 +2444,27 @@
       if (tab.editor !== ed || !tabs.includes(tab)) return;
       if (err.code === "modified_on_disk") {
         setEditorState(tab, "文件已在别处被修改");
-        const overwrite = await askConfirm(
+        retryForce = await askConfirm(
           "文件已在别处被修改",
           `${ed.path} 在打开之后被其他程序改过（或已被删除）。覆盖会丢掉那些修改。`,
           "仍然覆盖",
           true
         );
-        if (overwrite && tab.editor === ed) saveEditor(tab, true);
-        else ed.textarea.focus();
-        return;
+        if (!retryForce) ed.textarea.focus();
+      } else {
+        setEditorState(tab, `保存失败: ${err.message}`);
+        notice(`保存失败: ${err.message}`, true);
       }
-      setEditorState(tab, `保存失败: ${err.message}`);
-      notice(`保存失败: ${err.message}`, true);
+    } finally {
+      ed.saving = false;
+      ed.saveBtn.disabled = false;
+      if (tab.editor === ed && tabs.includes(tab)) {
+        if (retryForce) saveEditor(tab, true);
+        else if (ed.queued) {
+          ed.queued = false;
+          saveEditor(tab);
+        }
+      }
     }
   }
 
@@ -2538,9 +2582,8 @@
     if (!uploader) return;
     uploader.cancelled = true;
     try {
-      uploader.xhr.abort();
+      uploader.xhr?.abort();
     } catch (_) {}
-    fetch(uploader.url.replace(/&offset=.*$/, "").replace(/&total=.*$/, ""), { method: "DELETE" }).catch(() => {});
   });
   uploadInput.addEventListener("change", () => {
     uploadFiles(uploadInput.files);
@@ -2555,6 +2598,13 @@
     ev.preventDefault();
     filesEl.classList.remove("drop");
     if (ev.dataTransfer && ev.dataTransfer.files.length) uploadFiles(ev.dataTransfer.files);
+  });
+  // 文件拖到终端/编辑器等区域时，浏览器默认会导航离开页面。
+  document.addEventListener("dragover", (ev) => {
+    if (ev.dataTransfer && Array.from(ev.dataTransfer.types).includes("Files")) ev.preventDefault();
+  });
+  document.addEventListener("drop", (ev) => {
+    if (ev.dataTransfer && Array.from(ev.dataTransfer.types).includes("Files")) ev.preventDefault();
   });
 
   let resizeQueued = false;
@@ -2850,6 +2900,8 @@
           if (validSessionId(sid)) createPane(sid, tab);
         }
         if (tab.panes.length === 0) createPane("", tab);
+        const a = Number.isInteger(t && t.a) ? t.a : tab.panes.length - 1;
+        tab.activePane = tab.panes[Math.min(Math.max(a, 0), tab.panes.length - 1)] || null;
       }
       const wanted = Number.isInteger(saved.active) ? saved.active : 0;
       activateTab(tabs[Math.min(Math.max(wanted, 0), tabs.length - 1)]);
@@ -2908,6 +2960,7 @@
       try {
         const res = await fetch("/api/auth/status", { cache: "no-store" });
         if (res.status === 401) {
+          markAuthStopped();
           stopAuthKeepalive();
           showLogin("登录已失效，请重新登录");
         }
@@ -2924,12 +2977,15 @@
     }
   }
 
-  async function refreshAuth(attempt = 0) {
+  let authEpoch = 0;
+
+  async function refreshAuth(attempt = 0, epoch = authEpoch) {
+    if (epoch !== authEpoch) return;
     try {
       // 状态接口本身也要求认证：401 才是“未登录”。
       const res = await fetch("/api/auth/status", { cache: "no-store" });
       if (res.ok) {
-        startApp();
+        if (epoch === authEpoch) startApp();
         return;
       }
       if (res.status === 401) {
@@ -2937,17 +2993,17 @@
         return;
       }
       if (attempt < 3) {
-        setTimeout(() => refreshAuth(attempt + 1), 300 * (attempt + 1));
+        setTimeout(() => refreshAuth(attempt + 1, epoch), 300 * (attempt + 1));
         return;
       }
       showLogin(`服务端错误（HTTP ${res.status}），正在重试…`);
-      setTimeout(() => refreshAuth(0), 5000);
+      setTimeout(() => refreshAuth(0, epoch), 5000);
     } catch (_) {
       // 请求失败可能只是网络还没恢复（手机刚解锁、Wi-Fi 正在重连），
       // 不代表密码失效：自动退避重试，恢复后会直接进入界面。
       if (attempt === 0) showLogin("无法连接服务端，正在自动重试…");
       const delay = Math.min(5000, 400 * (attempt + 1));
-      setTimeout(() => refreshAuth(attempt + 1), delay);
+      setTimeout(() => refreshAuth(attempt + 1, epoch), delay);
     }
   }
 
@@ -2970,6 +3026,7 @@
         return;
       }
       loginPassword.value = "";
+      authEpoch++;
       startApp();
     } catch (_) {
       loginError.textContent = "网络错误，请重试";
@@ -2979,11 +3036,25 @@
   });
 
   logoutBtn.addEventListener("click", async () => {
+    const dirty = tabs.filter((t) => t.kind === "editor" && t.editor && t.editor.dirty);
+    if (dirty.length && !(await askConfirm(
+      "退出登录？",
+      `有 ${dirty.length} 个未保存的编辑页，退出后会丢失。`,
+      "退出并丢弃",
+      true
+    ))) return;
+
     logoutBtn.disabled = true;
+    let ok = false;
     try {
-      await fetch("/api/auth/logout", { method: "POST" });
+      ok = (await fetch("/api/auth/logout", { method: "POST" })).ok;
     } catch (_) {}
     logoutBtn.disabled = false;
+    if (!ok) {
+      notice("注销失败，请检查网络后重试", true);
+      return;
+    }
+    authEpoch++;
     stopApp();
     showLogin("已注销");
   });

@@ -13,6 +13,12 @@
   - `web/vendor/xterm/LICENSE.addon-search`
   - `web/vendor/xterm/LICENSE.addon-web-links`
 
+## Zig 标准库
+
+- 组件：Zig 标准库（静态链接进二进制）
+- 许可证：MIT
+- 完整文本：`licenses/zig.txt`
+
 ## JetBrains Mono
 
 - 组件：JetBrains Mono v2.304（Regular，woff2）

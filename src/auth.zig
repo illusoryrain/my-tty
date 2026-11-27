@@ -66,12 +66,21 @@ pub const Auth = struct {
     }
 
     fn nowNs(self: *const Auth) i96 {
-        return Io.Clock.real.now(self.io).nanoseconds;
+        return Io.Clock.awake.now(self.io).nanoseconds;
+    }
+
+    /// 先做定长哈希再比较，避免长度不同时提前返回泄露密码长度。
+    fn passwordMatches(candidate: []const u8, expected: []const u8) bool {
+        var a: [32]u8 = undefined;
+        var b: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(candidate, &a, .{});
+        std.crypto.hash.sha2.Sha256.hash(expected, &b, .{});
+        return std.crypto.timing_safe.eql([32]u8, a, b);
     }
 
     /// 密码正确时分配一个会话；返回 Cookie 值与绝对过期时间（Unix 秒）。
     pub fn login(self: *Auth, candidate: []const u8) ?Login {
-        if (!config.constantTimeEql(candidate, self.password)) return null;
+        if (!passwordMatches(candidate, self.password)) return null;
 
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -104,7 +113,7 @@ pub const Auth = struct {
             .used = true,
         };
 
-        const now_s: i64 = @intCast(@divTrunc(now, std.time.ns_per_s));
+        const now_s: i64 = @intCast(@divTrunc(Io.Clock.real.now(self.io).nanoseconds, std.time.ns_per_s));
         const expires_at_s = now_s + @as(i64, @intCast(self.ttl_days)) * 86400;
         return .{
             .cookie = std.fmt.bytesToHex(raw, .lower),

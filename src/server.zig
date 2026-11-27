@@ -263,6 +263,7 @@ pub fn run(io: Io, gpa: Allocator, cfg: *const config.Config) !void {
                 error.Canceled => break,
                 else => {
                     std.debug.print("accept 失败: {t}\n", .{err});
+                    Io.sleep(io, Io.Duration.fromMilliseconds(100), .real) catch {};
                     continue;
                 },
             }
@@ -422,6 +423,10 @@ fn handleHttp(
     // X-Forwarded-* 只有本机反向代理才有资格设置；直连客户端伪造的不认。
     const trust_forwarded = peerIsLoopback(peer);
 
+    // TE + CL 同时出现时，代理和后端可能选不同的长度，直接拒绝。
+    if (request.head.transfer_encoding != .none and request.head.content_length != null)
+        return respondClose(request, "{\"error\":\"bad_request\"}\n", .bad_request);
+
     // 只有登录和文件写入/上传会读取请求体。其余路径一旦带 body 就直接关闭，
     // 既不 drain 一个可能永远发不完的 body，也不给 std.http 的 keep-alive
     // 逻辑机会把残余字节解释成下一个请求。
@@ -454,8 +459,9 @@ fn handleHttp(
             // 真的 401 会打 cookie=yes/no，纯网络失败则什么都不会打。
             if (shouldLogAuthFailure(io, peer)) {
                 var pb: [64]u8 = undefined;
+                var lb: [256]u8 = undefined;
                 std.debug.print("未认证 API path={s} peer={s} cookie={s}\n", .{
-                    path,
+                    util.logText(&lb, path),
                     peerText(&pb, peer),
                     if (auth.cookieFromRequest(request) == null) "no" else "yes",
                 });
@@ -470,13 +476,14 @@ fn handleHttp(
         if (std.mem.eql(u8, path, "/api/auth/status")) return handleStatus(request);
         if (std.mem.eql(u8, path, "/api/auth/ticket")) return handleTicket(auth_state, request);
         if (std.mem.startsWith(u8, path, "/api/fs/")) {
-            // 大文件允许慢，但不能无限：按至少 32 KiB/s + 2 分钟给整个请求一个上限，
-            // 否则一个每分钟发一个字节的客户端能长期占住连接和上传临时文件。
+            // 所有已认证 API 都有总上限；下载/归档没有 body 长度，没有它慢客户端
+            // 可以永久占住连接槽。上传/写入再按体积收紧。
+            connSetDeadline(io, fd, 600);
+            defer connClearDeadline(io, fd);
             if (request.head.method == .PUT and util.requestHasBody(request)) {
                 const bytes: i96 = @intCast(request.head.content_length orelse 0);
                 const seconds = @min(@as(i96, 3600), 120 + @divTrunc(bytes, 32 * 1024));
                 connSetDeadline(io, fd, seconds);
-                defer connClearDeadline(io, fd);
             }
             return fsapi.handle(io, gpa, request);
         }

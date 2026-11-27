@@ -16,6 +16,8 @@ UPLOAD_SRC="$(mktemp)"
 UPLOAD_DST="$(mktemp)"
 CHUNK_SRC="$(mktemp)"
 TAR_FILE="$(mktemp)"
+CONFIG="$(mktemp)"
+echo '{}' >"$CONFIG"
 PID=""
 BASE="http://127.0.0.1:$PORT"
 API="$BASE/api/fs"
@@ -25,7 +27,7 @@ cleanup() {
     kill "$PID" 2>/dev/null || true
     wait "$PID" 2>/dev/null || true
   fi
-  rm -rf "$ROOT" "$LOG" "$COOKIE_JAR" "$UPLOAD_SRC" "$UPLOAD_DST" "$CHUNK_SRC" "$TAR_FILE" /tmp/mytty-chunk.*
+  rm -rf "$ROOT" "$LOG" "$COOKIE_JAR" "$UPLOAD_SRC" "$UPLOAD_DST" "$CHUNK_SRC" "$TAR_FILE" "$CONFIG"
 }
 trap cleanup EXIT
 
@@ -33,7 +35,11 @@ pass() { echo "$1: PASS"; }
 
 zig build
 
-"$BIN" --host 127.0.0.1 --port "$PORT" --password "$PASSWORD" >"$LOG" 2>&1 &
+if curl -fsS "http://127.0.0.1:$PORT/" >/dev/null 2>&1; then
+  echo "端口 $PORT 已被占用，请换一个 PORT" >&2
+  exit 2
+fi
+"$BIN" --config "$CONFIG" --host 127.0.0.1 --port "$PORT" --password "$PASSWORD" >"$LOG" 2>&1 &
 PID=$!
 
 echo "== index =="
@@ -123,6 +129,31 @@ curl -fsS -X PUT -b "$COOKIE_JAR" --data-binary 'smoke content' \
   "$API/write?path=$REL/note.txt&base=$VERSION" | grep -c '"ok":true' >/dev/null
 pass "write conflict"
 
+echo "== destructive write guards =="
+printf 'keep' >"$ROOT/keep.txt"
+code=$(curl -sS -o /dev/null -w '%{http_code}' -X PUT -b "$COOKIE_JAR" --data-binary 'new' \
+  "$API/write?path=$REL/keep.txt&exclusive=1")
+[ "$code" = "409" ]
+[ "$(cat "$ROOT/keep.txt")" = "keep" ]
+pass "exclusive create refuses existing file"
+
+printf 'a' >"$ROOT/a.txt"
+printf 'b' >"$ROOT/b.txt"
+code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST -b "$COOKIE_JAR" \
+  "$API/rename?from=$REL/a.txt&to=$REL/b.txt")
+[ "$code" = "409" ]
+[ "$(cat "$ROOT/b.txt")" = "b" ]
+[ -f "$ROOT/a.txt" ]
+pass "rename does not overwrite existing target"
+
+# 长路径 + 大于 1 KiB 的写响应：body 读完后不能再碰 header。
+LONG=$(printf 'd%.0s' $(seq 1 240))
+LONGPATH="$REL/$LONG/$LONG/$LONG/$LONG"
+curl -fsS -X POST -b "$COOKIE_JAR" "$API/mkdir?path=$LONGPATH" >/dev/null
+curl -fsS -X PUT -b "$COOKIE_JAR" --data-binary 'long' "$API/write?path=$LONGPATH/probe.txt" \
+  | grep -c '"ok":true' >/dev/null
+pass "long path write does not abort server"
+
 # 大 JSON（文本文件读取、大目录列表）应压缩；解压后必须和明文完全一致。
 head -c 4096 /dev/zero | tr '\0' 'a' >"$UPLOAD_SRC"
 curl -fsS -X PUT -b "$COOKIE_JAR" --data-binary @"$UPLOAD_SRC" "$API/write?path=$REL/gzip.txt" >/dev/null
@@ -134,13 +165,6 @@ curl -fsS -X DELETE -b "$COOKIE_JAR" "$API/delete?path=$REL/gzip.txt" >/dev/null
 pass "json gzip"
 
 echo "== fs hardening =="
-code=$(curl -sS -o /dev/null -w '%{http_code}' -b "$COOKIE_JAR" "$API/upload?path=&id=deadbeef")
-[ "$code" = "400" ]
-pass "empty upload status path rejected"
-code=$(curl -sS -o /dev/null -w '%{http_code}' -b "$COOKIE_JAR" -X DELETE "$API/upload?path=&id=deadbeef")
-[ "$code" = "400" ]
-pass "empty upload cancel path rejected"
-
 printf 'mode' > "$ROOT/mode.txt"
 chmod 600 "$ROOT/mode.txt"
 curl -fsS -X PUT -b "$COOKIE_JAR" --data-binary 'mode2' "$API/write?path=$REL/mode.txt" >/dev/null
@@ -196,23 +220,15 @@ pass "download headers"
 curl -fsS -X DELETE -b "$COOKIE_JAR" "$API/delete?path=$REL/up.bin" | grep -c '"ok":true' >/dev/null
 pass "cleanup upload"
 
-echo "== chunked upload =="
+echo "== large upload =="
 dd if=/dev/zero of="$CHUNK_SRC" bs=1024 count=3000 2>/dev/null
 printf 'old' > "$ROOT/chunk.bin"
 chmod 600 "$ROOT/chunk.bin"
-rm -f /tmp/mytty-chunk.*
-split -b 2000000 "$CHUNK_SRC" /tmp/mytty-chunk.
-off=0
-total=$(stat -c%s "$CHUNK_SRC")
-for part in /tmp/mytty-chunk.*; do
-  size=$(stat -c%s "$part")
-  curl -fsS -X PUT -b "$COOKIE_JAR" --data-binary @"$part" \
-    "$API/upload?path=$REL/chunk.bin&id=abcdef0123456789&offset=$off&total=$total" >/dev/null
-  off=$((off + size))
-done
+curl -fsS -X PUT -b "$COOKIE_JAR" --data-binary @"$CHUNK_SRC" \
+  "$API/upload?path=$REL/chunk.bin" >/dev/null
 cmp -s "$CHUNK_SRC" "$ROOT/chunk.bin"
 [ "$(stat -c%a "$ROOT/chunk.bin")" = "600" ]
-pass "chunked upload preserves permissions"
+pass "upload preserves permissions"
 curl -fsS -X DELETE -b "$COOKIE_JAR" "$API/delete?path=$REL/chunk.bin" >/dev/null
 
 echo "== archive =="

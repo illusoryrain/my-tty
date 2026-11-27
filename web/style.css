@@ -1428,7 +1428,10 @@ button.icon {
   }
 
   #prompt-input,
-  #login-password {
+  #login-password,
+  #find-input,
+  .editor-text,
+  .editor-gutter {
     /* iOS 在字体小于 16px 时会自动放大页面。 */
     font-size: 16px;
   }

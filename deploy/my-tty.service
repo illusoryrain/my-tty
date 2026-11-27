@@ -25,6 +25,18 @@ TimeoutStopSec=15
 # 只给主进程发 SIGTERM，让它自己回收各个 PTY；超时后再整组 SIGKILL。
 KillMode=mixed
 LimitNOFILE=65536
+UMask=0077
+# 与终端日常使用不冲突的内核/命名空间收紧；会破坏 sudo/构建的选项仍保持关闭。
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+TasksMax=512
 
 StandardOutput=journal
 StandardError=journal
