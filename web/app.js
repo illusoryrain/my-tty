@@ -23,12 +23,6 @@
   const statusEl = document.getElementById("status");
   const hintEl = document.getElementById("hint");
 
-  const editorOverlay = document.getElementById("editor-overlay");
-  const editorEl = document.getElementById("editor");
-  const editorPathEl = document.getElementById("editor-path");
-  const editorStateEl = document.getElementById("editor-state");
-  const editorSaveBtn = document.getElementById("editor-save");
-  const editorCloseBtn = document.getElementById("editor-close");
   const logoutBtn = document.getElementById("logout");
   const loginOverlay = document.getElementById("login-overlay");
   const loginForm = document.getElementById("login-form");
@@ -54,7 +48,6 @@
   const uprogFill = document.getElementById("uprog-fill");
   const uprogText = document.getElementById("uprog-text");
   const uprogCancel = document.getElementById("uprog-cancel");
-  const editorGutter = document.getElementById("editor-gutter");
 
   const scheme = location.protocol === "https:" ? "wss:" : "ws:";
   const wsBase = `${scheme}//${location.host}/ws`;
@@ -94,7 +87,16 @@
   const treeLoading = new Set();
   let treeRootError = false;
   let cwdSyncEnabled = store.get("myttty.cwdSync") !== "0";
-  let editing = null; // { path, dirty }
+  // 终端内悬浮状态栏的位置（0..1，按可移动空间归一化），所有分屏共用。
+  let paneBarPos = (() => {
+    try {
+      const v = JSON.parse(store.get("myttty.paneBar") || "null");
+      if (!v || !Number.isFinite(v.x) || !Number.isFinite(v.y)) return { x: 1, y: 0 };
+      return { x: Math.min(1, Math.max(0, v.x)), y: Math.min(1, Math.max(0, v.y)) };
+    } catch (_) {
+      return { x: 1, y: 0 };
+    }
+  })();
   let started = false;
   let fontsize = clampFont(parseInt(store.get("myttty.fontsize") || "14", 10) || 14);
   let splitX = parseFloat(store.get("myttty.splitX") || "0.5") || 0.5;
@@ -235,11 +237,12 @@
     }
   }
 
-  function addTab() {
+  function addTab(kind = "terminal") {
     if (tabs.length >= MAX_TABS) return null;
 
     const el = document.createElement("div");
     el.className = "tab-workspace";
+    if (kind === "editor") el.classList.add("editor-workspace");
     el.hidden = true;
     workspace.appendChild(el);
 
@@ -251,7 +254,7 @@
     const label = document.createElement("button");
     label.type = "button";
     label.className = "tab-label";
-    label.textContent = `终端 ${++tabSeq}`;
+    if (kind === "terminal") label.textContent = `终端 ${++tabSeq}`;
 
     const close = document.createElement("button");
     close.type = "button";
@@ -263,13 +266,23 @@
     btn.appendChild(close);
     tabListEl.appendChild(btn);
 
-    const tab = { el, btn, label, panes: [], activePane: null, splitX: 0.5, splitY: 0.5 };
+    const tab = {
+      kind,
+      el,
+      btn,
+      label,
+      panes: [],
+      activePane: null,
+      splitX: 0.5,
+      splitY: 0.5,
+      editor: null,
+    };
     tabs.push(tab);
 
     btn.addEventListener("click", () => activateTab(tab));
-    close.addEventListener("click", (ev) => {
+    close.addEventListener("click", async (ev) => {
       ev.stopPropagation();
-      closeTab(tab);
+      await closeTab(tab);
     });
 
     updateTabHint();
@@ -278,7 +291,7 @@
   }
 
   function newTab() {
-    const tab = addTab();
+    const tab = addTab("terminal");
     if (!tab) return;
     activateTab(tab);
     createPane("", tab);
@@ -288,23 +301,32 @@
     if (!tab || tab === activeTab) return;
 
     if (activeTab) {
-      activeTab.splitX = splitX;
-      activeTab.splitY = splitY;
-      activeTab.activePane = activePane;
+      if (activeTab.kind === "terminal") {
+        activeTab.splitX = splitX;
+        activeTab.splitY = splitY;
+        activeTab.activePane = activePane;
+        if (activePane) activePane.term.blur();
+      } else if (activeTab.editor) {
+        activeTab.editor.textarea.blur();
+      }
       activeTab.el.hidden = true;
       activeTab.btn.classList.remove("active");
       activeTab.btn.setAttribute("aria-selected", "false");
-      if (activePane) activePane.term.blur();
     }
 
     activeTab = tab;
-    panes = tab.panes;
-    splitX = tab.splitX;
-    splitY = tab.splitY;
-    activePane =
-      tab.activePane && tab.panes.includes(tab.activePane)
-        ? tab.activePane
-        : tab.panes[tab.panes.length - 1] || null;
+    if (tab.kind === "terminal") {
+      panes = tab.panes;
+      splitX = tab.splitX;
+      splitY = tab.splitY;
+      activePane =
+        tab.activePane && tab.panes.includes(tab.activePane)
+          ? tab.activePane
+          : tab.panes[tab.panes.length - 1] || null;
+    } else {
+      panes = [];
+      activePane = null;
+    }
 
     tab.el.hidden = false;
     tab.btn.classList.add("active");
@@ -315,18 +337,36 @@
     layoutTabs();
     updateSummary();
     saveSessions();
-    if (cwdSyncEnabled && activePane && activePane.cwd) syncFilesToCwd(activePane.cwd);
-    requestAnimationFrame(() => {
-      for (const p of tab.panes) fitPane(p);
-      if (activePane && !coarsePointer) activePane.term.focus();
-    });
+    if (tab.kind === "terminal") {
+      if (cwdSyncEnabled && activePane && activePane.cwd) syncFilesToCwd(activePane.cwd);
+      requestAnimationFrame(() => {
+        for (const p of tab.panes) fitPane(p);
+        if (activePane && !coarsePointer) activePane.term.focus();
+      });
+    } else if (tab.editor) {
+      requestAnimationFrame(() => {
+        updateEditorGutter(tab);
+        tab.editor.textarea.focus();
+      });
+    }
   }
 
-  function closeTab(tab) {
+  async function closeTab(tab) {
     const idx = tabs.indexOf(tab);
     if (idx === -1) return;
+    if (tab.kind === "editor" && tab.editor && tab.editor.dirty) {
+      const ok = await askConfirm(
+        "放弃未保存的修改？",
+        `${tab.editor.path} 有未保存的修改，关闭后会丢失。`,
+        "放弃并关闭",
+        true
+      );
+      if (!ok) return;
+    }
 
-    for (const pane of [...tab.panes]) removePane(pane, false);
+    if (tab.kind === "terminal") {
+      for (const pane of [...tab.panes]) removePane(pane, false);
+    }
     tab.el.remove();
     tab.btn.remove();
     tabs.splice(idx, 1);
@@ -355,6 +395,7 @@
     el.className = "pane";
     el.innerHTML = `
       <div class="pane-bar">
+        <span class="pane-grip" title="拖动调整位置" aria-hidden="true"></span>
         <span class="pane-dot"></span>
         <span class="pane-status">连接中…</span>
         <button class="pane-close" type="button" title="关闭此分屏" aria-label="关闭此分屏"><svg class="ico" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8"/><path d="M12 4l-8 8"/></svg></button>
@@ -588,12 +629,17 @@
     term.onData((data) => sendInput(pane, data));
     term.onResize(() => sendResize(pane));
 
-    el.addEventListener("mousedown", () => focusPane(pane));
+    el.addEventListener("mousedown", (ev) => {
+      // 拖动悬浮状态栏时不要把焦点打到终端上（移动端会弹出软键盘）。
+      if (ev.target.closest(".pane-bar")) return;
+      focusPane(pane);
+    });
     termEl.addEventListener("focusin", () => focusPane(pane));
     el.querySelector(".pane-close").addEventListener("click", (ev) => {
       ev.stopPropagation();
       removePane(pane);
     });
+    el.querySelector(".pane-grip").addEventListener("pointerdown", (ev) => startPaneBarDrag(ev, pane));
     status.addEventListener("click", () => {
       if (!pane.alive && pane.reconnect) pane.reconnect();
     });
@@ -601,6 +647,7 @@
     connectPane(pane);
     layout(tab);
     if (tab === activeTab) focusPane(pane);
+    requestAnimationFrame(() => positionPaneBar(pane));
     saveSessions();
   }
 
@@ -661,11 +708,13 @@
 
   function saveSessions() {
     try {
+      // 只持久化终端标签；文件编辑标签不恢复内容，刷新后重新打开即可。
+      const termTabs = tabs.filter((t) => t.kind === "terminal");
       sessionStorage.setItem(
         "myttty.tabs",
         JSON.stringify({
-          active: Math.max(0, tabs.indexOf(activeTab)),
-          tabs: tabs.map((t) => ({
+          active: Math.max(0, termTabs.indexOf(activeTab)),
+          tabs: termTabs.map((t) => ({
             x: t.splitX,
             y: t.splitY,
             s: t.panes.map((p) => p.sessionId || ""),
@@ -963,12 +1012,79 @@
     }
   }
 
+  function positionPaneBar(pane) {
+    const bar = pane.bar;
+    if (!bar || !pane.el.isConnected) return;
+    const w = pane.el.clientWidth;
+    const h = pane.el.clientHeight;
+    const bw = bar.offsetWidth;
+    const bh = bar.offsetHeight;
+    if (!w || !h || !bw || !bh) return;
+    // 状态栏位置按“可移动空间”归一化（0..1），窗口/分屏尺寸变化后仍然成立。
+    const maxX = Math.max(0, w - bw - 6);
+    const maxY = Math.max(0, h - bh - 6);
+    const x = Math.min(maxX, Math.max(0, paneBarPos.x * maxX));
+    const y = Math.min(maxY, Math.max(0, paneBarPos.y * maxY));
+    bar.style.left = `${Math.round(x)}px`;
+    bar.style.top = `${Math.round(y)}px`;
+    bar.style.right = "auto";
+  }
+
+  function startPaneBarDrag(ev, pane) {
+    if (ev.button !== 0 || !pane.bar) return;
+    // 触摸布局里状态栏固定在 pane 顶部（position: static），不需要也不能拖。
+    if (getComputedStyle(pane.bar).position === "static") return;
+    const handle = ev.currentTarget;
+    const bar = pane.bar;
+    const pr = pane.el.getBoundingClientRect();
+    const br = bar.getBoundingClientRect();
+    const grabX = ev.clientX - br.left;
+    const grabY = ev.clientY - br.top;
+    let moved = false;
+
+    const move = (e) => {
+      if (!moved && Math.hypot(e.clientX - ev.clientX, e.clientY - ev.clientY) < 3) return;
+      moved = true;
+      bar.classList.add("dragging");
+      const maxX = Math.max(0, pr.width - bar.offsetWidth - 6);
+      const maxY = Math.max(0, pr.height - bar.offsetHeight - 6);
+      const left = Math.min(maxX, Math.max(0, e.clientX - pr.left - grabX));
+      const top = Math.min(maxY, Math.max(0, e.clientY - pr.top - grabY));
+      bar.style.left = `${Math.round(left)}px`;
+      bar.style.top = `${Math.round(top)}px`;
+      bar.style.right = "auto";
+      paneBarPos = { x: maxX ? left / maxX : 0, y: maxY ? top / maxY : 0 };
+    };
+    const up = () => {
+      handle.removeEventListener("pointermove", move);
+      handle.removeEventListener("pointerup", up);
+      handle.removeEventListener("pointercancel", up);
+      bar.classList.remove("dragging");
+      try {
+        handle.releasePointerCapture(ev.pointerId);
+      } catch (_) {}
+      if (!moved) return;
+      store.set("myttty.paneBar", JSON.stringify(paneBarPos));
+      for (const t of tabs) {
+        for (const p of t.panes) positionPaneBar(p);
+      }
+    };
+
+    try {
+      handle.setPointerCapture(ev.pointerId);
+    } catch (_) {}
+    handle.addEventListener("pointermove", move);
+    handle.addEventListener("pointerup", up);
+    handle.addEventListener("pointercancel", up);
+  }
+
   function setPaneStatus(pane, text, kind) {
     pane.status.textContent = text;
     pane.status.className = `pane-status ${kind || ""}`;
     pane.dot.className = `pane-dot ${kind || ""}`;
     // 悬浮标题栏默认隐藏；出错时常驻，方便点击重连/关闭。
     pane.bar.classList.toggle("attention", kind === "error");
+    positionPaneBar(pane);
     if (pane.tab) {
       pane.tab.btn.classList.toggle(
         "down",
@@ -979,6 +1095,13 @@
   }
 
   function updateSummary() {
+    if (activeTab && activeTab.kind === "editor") {
+      const ed = activeTab.editor;
+      statusEl.textContent = ed ? (ed.dirty ? `${ed.name} · 未保存` : ed.name) : "文件";
+      statusEl.title = ed ? ed.path : "";
+      statusEl.className = ed && ed.dirty ? "pending" : "";
+      return;
+    }
     const total = panes.length;
     const alive = panes.filter((p) => p.alive).length;
     // 全部正常时只显示“已连接”；只有分屏掉线时才显示 alive/total，
@@ -1055,6 +1178,7 @@
     }
 
     sendResize(pane);
+    positionPaneBar(pane);
   }
 
   const splitters = { v: null, h: null };
@@ -1157,6 +1281,16 @@
 
   function layout(tab = activeTab) {
     if (!tab) return;
+    if (tab.kind === "editor") {
+      tab.el.dataset.count = "";
+      if (splitters.v) splitters.v.hidden = true;
+      if (splitters.h) splitters.h.hidden = true;
+      if (tab === activeTab) {
+        addPaneBtn.disabled = true;
+        updateSummary();
+      }
+      return;
+    }
     tab.el.dataset.count = String(tab.panes.length);
     ensureSplitters();
     applyGrid(tab);
@@ -2128,93 +2262,174 @@
 
   // ------------------------------------------------------------------- editor
 
+  function baseName(path) {
+    const i = path.lastIndexOf("/");
+    return i === -1 ? path : path.slice(i + 1);
+  }
+
+  function buildEditorTab(tab, path) {
+    tab.el.classList.add("editor-workspace");
+    const el = document.createElement("section");
+    el.className = "editor-tab";
+    el.innerHTML = `
+      <header class="editor-toolbar">
+        <span class="editor-path"></span>
+        <span class="editor-state">加载中…</span>
+        <span class="spacer"></span>
+        <button class="icon editor-save" type="button" title="保存 (Ctrl+S)" aria-label="保存"><svg class="ico" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 2.5h7l3 3v8H3z"/><path d="M5.5 2.5v3.5h5V2.5"/><path d="M5 9.5h6"/></svg></button>
+      </header>
+      <div class="editor-body">
+        <pre class="editor-gutter" aria-hidden="true"></pre>
+        <textarea class="editor-text" spellcheck="false" autocomplete="off" autocapitalize="off" readonly></textarea>
+      </div>`;
+    tab.el.appendChild(el);
+
+    const pathEl = el.querySelector(".editor-path");
+    const stateEl = el.querySelector(".editor-state");
+    const textarea = el.querySelector(".editor-text");
+    const gutter = el.querySelector(".editor-gutter");
+    const saveBtn = el.querySelector(".editor-save");
+    pathEl.textContent = path;
+    pathEl.title = path;
+
+    const ed = {
+      path,
+      name: baseName(path),
+      version: "",
+      dirty: false,
+      loaded: false,
+      textarea,
+      gutter,
+      stateEl,
+      saveBtn,
+      lineCount: 0,
+      gutterQueued: false,
+    };
+    tab.editor = ed;
+    tab.label.textContent = ed.name;
+    tab.label.title = path;
+
+    textarea.addEventListener("input", () => {
+      if (!ed.loaded) return;
+      ed.dirty = true;
+      setEditorState(tab, "未保存的修改");
+      scheduleEditorGutter(tab);
+    });
+    textarea.addEventListener("scroll", () => {
+      gutter.scrollTop = textarea.scrollTop;
+    });
+    textarea.addEventListener("keydown", (ev) => {
+      if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "s") {
+        ev.preventDefault();
+        saveEditor(tab);
+        return;
+      }
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        ev.stopPropagation();
+        closeTab(tab);
+        return;
+      }
+      if (ev.key === "Tab") {
+        ev.preventDefault();
+        const start = textarea.selectionStart;
+        const end = textarea.selectionEnd;
+        textarea.setRangeText("  ", start, end, "end");
+        textarea.dispatchEvent(new Event("input"));
+      }
+    });
+    saveBtn.addEventListener("click", () => saveEditor(tab));
+    return ed;
+  }
+
+  function setEditorState(tab, text) {
+    const ed = tab.editor;
+    if (!ed) return;
+    ed.stateEl.textContent = text;
+    tab.btn.classList.toggle("dirty", ed.dirty);
+    if (tab === activeTab) updateSummary();
+  }
+
   async function openEditor(path) {
-    if (editing && editing.dirty && editing.path !== path) {
-      if (!(await askConfirm("放弃未保存的修改？", `${editing.path} 有未保存的修改，切换后会丢失。`, "放弃并切换", true))) return;
+    const existing = tabs.find((t) => t.kind === "editor" && t.editor && t.editor.path === path);
+    if (existing) {
+      activateTab(existing);
+      requestAnimationFrame(() => existing.editor.textarea.focus());
+      return;
     }
+
+    const tab = addTab("editor");
+    if (!tab) {
+      notice("标签页已达上限", true);
+      return;
+    }
+    const ed = buildEditorTab(tab, path);
+    activateTab(tab);
+
+    let data;
     try {
-      const data = await api("GET", "read", { path });
-      // version 是服务端给的内容哈希；保存时带回去，文件在此期间被改过就会被拒绝。
-      editing = { path, dirty: false, version: data.version || "" };
-      editorPathEl.textContent = path;
-      editorEl.value = data.content;
-      editorStateEl.textContent = `${data.size} 字节 · 未修改`;
-      editorOverlay.hidden = false;
-      updateGutter();
-      editorEl.focus();
-      editorEl.setSelectionRange(0, 0);
+      data = await api("GET", "read", { path });
     } catch (err) {
+      if (!tabs.includes(tab)) return;
       notice(`打开失败: ${err.message}`, true);
+      await closeTab(tab);
+      return;
+    }
+    if (!tabs.includes(tab) || tab.editor !== ed) return;
+
+    // version 是服务端给的内容哈希；保存时带回去，文件在此期间被改过就会被拒绝。
+    ed.version = data.version || "";
+    ed.textarea.value = data.content;
+    ed.textarea.readOnly = false;
+    ed.loaded = true;
+    setEditorState(tab, `${data.size} 字节 · 未修改`);
+    updateEditorGutter(tab);
+    if (tab === activeTab) {
+      ed.textarea.focus();
+      ed.textarea.setSelectionRange(0, 0);
     }
   }
 
-  async function closeEditor() {
-    if (editing && editing.dirty) {
-      if (!(await askConfirm("放弃未保存的修改？", `${editing.path} 有未保存的修改，关闭后会丢失。`, "放弃并关闭", true))) return;
-    }
-    editing = null;
-    editorOverlay.hidden = true;
-  }
-
-  async function saveEditor(force = false) {
-    if (!editing) return;
-    const target = editing;
-    const query = { path: target.path };
-    if (!force && target.version) query.base = target.version;
-    const text = editorEl.value;
+  async function saveEditor(tab, force = false) {
+    const ed = tab && tab.editor;
+    if (!ed || !ed.loaded) return;
+    const query = { path: ed.path };
+    if (!force && ed.version) query.base = ed.version;
+    const text = ed.textarea.value;
     try {
       const res = await api("PUT", "write", query, text);
-      if (editing !== target) return;
-      editing.version = res.version || "";
+      if (tab.editor !== ed || !tabs.includes(tab)) return;
+      ed.version = res.version || "";
       // 保存请求在路上时用户可能又敲了字：那部分仍算未保存。
-      editing.dirty = editorEl.value !== text;
-      editorStateEl.textContent = editing.dirty ? "未保存的修改" : `${res.size} 字节 · 已保存`;
-      notice(`已保存 ${editing.path}`);
-      refreshFiles([parentOf(editing.path)]);
+      ed.dirty = ed.textarea.value !== text;
+      setEditorState(tab, ed.dirty ? "未保存的修改" : `${res.size} 字节 · 已保存`);
+      notice(`已保存 ${ed.path}`);
+      refreshFiles([parentOf(ed.path)]);
     } catch (err) {
-      if (editing !== target) return;
+      if (tab.editor !== ed || !tabs.includes(tab)) return;
       if (err.code === "modified_on_disk") {
-        editorStateEl.textContent = "文件已在别处被修改";
+        setEditorState(tab, "文件已在别处被修改");
         const overwrite = await askConfirm(
           "文件已在别处被修改",
-          `${target.path} 在打开之后被其他程序改过（或已被删除）。覆盖会丢掉那些修改。`,
+          `${ed.path} 在打开之后被其他程序改过（或已被删除）。覆盖会丢掉那些修改。`,
           "仍然覆盖",
           true
         );
-        if (overwrite && editing === target) saveEditor(true);
-        else editorEl.focus();
+        if (overwrite && tab.editor === ed) saveEditor(tab, true);
+        else ed.textarea.focus();
         return;
       }
-      editorStateEl.textContent = `保存失败: ${err.message}`;
+      setEditorState(tab, `保存失败: ${err.message}`);
       notice(`保存失败: ${err.message}`, true);
     }
   }
 
-  editorEl.addEventListener("input", () => {
-    if (!editing) return;
-    editing.dirty = true;
-    editorStateEl.textContent = "未保存的修改";
-    scheduleGutter();
-  });
-  editorEl.addEventListener("keydown", (ev) => {
-    if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "s") {
-      ev.preventDefault();
-      saveEditor();
-    }
-  });
-  editorSaveBtn.addEventListener("click", () => saveEditor());
-  editorCloseBtn.addEventListener("click", closeEditor);
-  window.addEventListener("keydown", (ev) => {
-    if (!promptOverlay.hidden) return;
-    if (ev.key === "Escape" && !editorOverlay.hidden) {
-      ev.preventDefault();
-      closeEditor();
-    }
-  });
-
   // -------------------------------------------------------------------- boot
 
-  addPaneBtn.addEventListener("click", () => createPane());
+  addPaneBtn.addEventListener("click", () => {
+    if (!activeTab || activeTab.kind !== "terminal") return;
+    createPane();
+  });
   tabAddBtn.addEventListener("click", () => newTab());
   tabMoreBtn.addEventListener("click", (ev) => {
     ev.stopPropagation();
@@ -2280,10 +2495,20 @@
       return;
     }
     if (ev.key === "Escape") {
-      if (!editorOverlay.hidden) return; // 编辑器自己处理
       if (!findBar.hidden) {
         ev.preventDefault();
         closeFind();
+        return;
+      }
+      if (!promptOverlay.hidden || !loginOverlay.hidden) return;
+      // 焦点在编辑器工具栏（例如刚点过保存）时，Esc 也要能关闭编辑标签。
+      if (
+        activeTab &&
+        activeTab.kind === "editor" &&
+        !(ev.target instanceof Element && ev.target.closest("#find-bar"))
+      ) {
+        ev.preventDefault();
+        closeTab(activeTab);
       }
     }
   });
@@ -2520,9 +2745,6 @@
 
   // 大文件（上限 1 MiB，可能几万行）每按一个键都重建行号会明显卡顿：
   // 输入事件按帧合并，行数没变就不动 DOM。
-  let gutterLines = 0;
-  let gutterQueued = false;
-
   function countLines(value) {
     let count = 1;
     let i = -1;
@@ -2531,40 +2753,31 @@
     return Math.max(1, count);
   }
 
-  function updateGutter() {
-    const count = countLines(editorEl.value);
-    if (count !== gutterLines) {
-      gutterLines = count;
+  function updateEditorGutter(tab) {
+    const ed = tab && tab.editor;
+    if (!ed) return;
+    const count = countLines(ed.textarea.value);
+    if (count !== ed.lineCount) {
+      ed.lineCount = count;
       const lines = new Array(count);
       for (let i = 0; i < count; i++) lines[i] = i + 1;
-      editorGutter.textContent = lines.join("\n") + "\n";
+      ed.gutter.textContent = lines.join("\n") + "\n";
     }
-    editorGutter.scrollTop = editorEl.scrollTop;
+    ed.gutter.scrollTop = ed.textarea.scrollTop;
   }
 
-  function scheduleGutter() {
-    if (gutterQueued) return;
-    gutterQueued = true;
+  function scheduleEditorGutter(tab) {
+    const ed = tab && tab.editor;
+    if (!ed || ed.gutterQueued) return;
+    ed.gutterQueued = true;
     requestAnimationFrame(() => {
-      gutterQueued = false;
-      updateGutter();
+      ed.gutterQueued = false;
+      if (tab.editor === ed) updateEditorGutter(tab);
     });
   }
 
-  editorEl.addEventListener("scroll", () => {
-    editorGutter.scrollTop = editorEl.scrollTop;
-  });
-  editorEl.addEventListener("keydown", (ev) => {
-    if (ev.key === "Tab") {
-      ev.preventDefault();
-      const start = editorEl.selectionStart;
-      const end = editorEl.selectionEnd;
-      editorEl.setRangeText("  ", start, end, "end");
-      editorEl.dispatchEvent(new Event("input"));
-    }
-  });
   window.addEventListener("beforeunload", (ev) => {
-    if (editing && editing.dirty) {
+    if (tabs.some((t) => t.kind === "editor" && t.editor && t.editor.dirty)) {
       ev.preventDefault();
       ev.returnValue = "";
     }

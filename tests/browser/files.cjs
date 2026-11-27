@@ -81,8 +81,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   await page.waitForSelector("#prompt-overlay:not([hidden])");
   await page.fill("#prompt-input", "created-by-modal.txt");
   await page.click("#prompt-ok");
-  await page.waitForSelector("#editor-overlay:not([hidden])");
-  await page.click("#editor-close");
+  await page.waitForFunction(() => {
+    const el = document.querySelector(".tab-workspace:not([hidden]) .editor-text");
+    return !!el && !el.readOnly;
+  });
+  await page.locator(".tab.active .tab-close").click();
+  await page.waitForFunction(() => !document.querySelector(".tab-workspace:not([hidden]) .editor-text"));
   await page.waitForTimeout(200);
 
   const uploadRel = `${ROOT_REL}/my-tty-upload-src.bin`;

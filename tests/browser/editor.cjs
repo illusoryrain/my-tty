@@ -41,39 +41,44 @@ const assert = (c, m) => { if (!c) throw new Error("ASSERT: " + m); };
   const row = page.locator("#file-list .entry.file", { hasText: "conf.txt" });
   await row.waitFor();
   await row.locator(".name").click();
-  await page.waitForSelector("#editor-overlay:not([hidden])");
-  await page.locator("#editor").fill("mine\n");
+  const editor = ".tab-workspace:not([hidden]) .editor-text";
+  await page.waitForSelector(editor);
+  assert(
+    (await page.textContent(".tab.active .tab-label")) === "conf.txt",
+    "file opens in its own editor tab"
+  );
+  await page.locator(editor).fill("mine\n");
   fs.writeFileSync(path.join(ROOT, "conf.txt"), "theirs\n");
-  await page.click("#editor-save");
+  await page.click(".tab-workspace:not([hidden]) .editor-save");
   await page.waitForSelector("#prompt-overlay:not([hidden])");
   assert((await page.textContent("#prompt-title")).includes("已在别处被修改"), "conflict title");
   assert(await page.isHidden("#prompt-input"), "input hidden in confirm");
   assert(fs.readFileSync(path.join(ROOT, "conf.txt"), "utf8") === "theirs\n", "not overwritten");
   await page.click("#prompt-cancel");
   await page.waitForSelector("#prompt-overlay", { state: "hidden" });
-  await page.click("#editor-save");
+  await page.click(".tab-workspace:not([hidden]) .editor-save");
   await page.waitForSelector("#prompt-overlay:not([hidden])");
   await page.click("#prompt-ok");
-  await page.waitForFunction(() => document.querySelector("#editor-state").textContent.includes("已保存"));
+  await page.waitForFunction(() => document.querySelector(".tab-workspace:not([hidden]) .editor-state").textContent.includes("已保存"));
   assert(fs.readFileSync(path.join(ROOT, "conf.txt"), "utf8") === "mine\n", "forced overwrite");
   // 再次保存（使用新 version）不应冲突
-  await page.locator("#editor").fill("mine2\n");
-  await page.click("#editor-save");
-  await page.waitForFunction(() => document.querySelector("#editor-state").textContent.includes("已保存"));
+  await page.locator(editor).fill("mine2\n");
+  await page.click(".tab-workspace:not([hidden]) .editor-save");
+  await page.waitForFunction(() => document.querySelector(".tab-workspace:not([hidden]) .editor-state").textContent.includes("已保存"));
   assert(fs.readFileSync(path.join(ROOT, "conf.txt"), "utf8") === "mine2\n", "second save");
   console.log("editor conflict ok");
 
   // 3. 未保存时关闭 -> 自定义确认；Esc 取消
-  await page.locator("#editor").fill("dirty\n");
-  await page.click("#editor-close");
+  await page.locator(editor).fill("dirty\n");
+  await page.locator(".tab.active .tab-close").click();
   await page.waitForSelector("#prompt-overlay:not([hidden])");
   await page.keyboard.press("Escape");
   await page.waitForSelector("#prompt-overlay", { state: "hidden" });
-  assert(await page.isVisible("#editor-overlay"), "editor still open after cancel");
-  await page.click("#editor-close");
+  assert(await page.isVisible(editor), "editor tab still open after cancel");
+  await page.locator(".tab.active .tab-close").click();
   await page.waitForSelector("#prompt-overlay:not([hidden])");
   await page.click("#prompt-ok");
-  await page.waitForSelector("#editor-overlay", { state: "hidden" });
+  await page.waitForFunction(() => !document.querySelector(".tab-workspace:not([hidden]) .editor-text"));
   console.log("close confirm ok");
 
   // 4. 删除确认

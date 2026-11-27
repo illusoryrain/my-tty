@@ -114,23 +114,6 @@
       </form>
     </div>
 
-    <div id="editor-overlay" hidden>
-      <section class="editor" role="dialog" aria-modal="true">
-        <header>
-          <span id="editor-path"></span>
-          <span id="editor-state"></span>
-          <span class="spacer"></span>
-          <button id="editor-save" class="icon" type="button" title="保存 (Ctrl+S)" aria-label="保存"><svg class="ico" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 2.5h7l3 3v8H3z"/><path d="M5.5 2.5v3.5h5V2.5"/><path d="M5 9.5h6"/></svg></button>
-          <button id="editor-close" class="icon" type="button" title="关闭 (Esc)" aria-label="关闭"><svg class="ico" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8"/><path d="M12 4l-8 8"/></svg></button>
-        </header>
-        <div class="editor-body">
-          <pre id="editor-gutter" aria-hidden="true"></pre>
-          <textarea id="editor" spellcheck="false" autocomplete="off"></textarea>
-        </div>
-        <footer>Ctrl+S 保存 · Esc 关闭</footer>
-      </section>
-    </div>
-
     <script src="/vendor/xterm/xterm.js"></script>
     <script src="/vendor/xterm/addon-fit.js"></script>
     <script src="/vendor/xterm/addon-search.js"></script>

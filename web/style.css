@@ -754,6 +754,13 @@ button.icon {
   pointer-events: none;
 }
 
+.pane-bar.dragging {
+  opacity: 1;
+  transform: none;
+  pointer-events: auto;
+  cursor: grabbing;
+}
+
 .pane:hover .pane-bar,
 .pane:focus-within .pane-bar,
 .pane-bar.attention {
@@ -768,6 +775,21 @@ button.icon {
     transform: none;
     pointer-events: auto;
   }
+}
+
+/* 抓手是唯一能拖动状态栏的地方，点击状态文字仍然是重连。 */
+.pane-grip {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 12px;
+  cursor: grab;
+  touch-action: none;
+  background-image: radial-gradient(circle, #5f6880 1px, transparent 1px);
+  background-size: 4px 4px;
+}
+
+.pane-grip:active {
+  cursor: grabbing;
 }
 
 .pane-dot {
@@ -842,69 +864,89 @@ button.icon {
 
 /* -------------------------------------------------------------- editor */
 
-#editor-overlay {
-  position: fixed;
-  inset: 0;
-  display: grid;
-  place-items: center;
-  background: rgb(8 10 14 / 0.72);
-  backdrop-filter: blur(2px);
-  z-index: 20;
+/* 文件编辑是独立标签页，和终端标签共用标签栏，不再用弹窗遮挡终端。 */
+.tab-workspace.editor-workspace {
+  display: block;
+  background: var(--bg);
 }
 
-#editor-overlay[hidden] {
+.tab-workspace.editor-workspace[hidden] {
   display: none;
 }
 
-.editor {
-  width: min(1000px, calc(100vw - 40px));
-  height: min(760px, calc(100vh - 60px));
+.editor-tab {
+  position: absolute;
+  inset: 0;
   display: flex;
   flex-direction: column;
-  background: #171b24;
-  border: 1px solid #2a3042;
-  border-radius: 10px;
-  box-shadow: 0 18px 60px rgb(0 0 0 / 0.5);
-  overflow: hidden;
+  min-width: 0;
+  min-height: 0;
+  background: var(--bg);
 }
 
-.editor header {
+.editor-toolbar {
   display: flex;
   align-items: center;
   gap: 10px;
+  flex: 0 0 auto;
   padding: 8px 12px;
   border-bottom: 1px solid var(--line);
   font-size: 12px;
   color: var(--dim);
 }
 
-.editor header .spacer {
+.editor-toolbar .spacer {
   flex: 1 1 auto;
 }
 
-.editor header #editor-save,
-.editor header #editor-close {
+.editor-toolbar .editor-save {
   flex: 0 0 auto;
   width: 26px;
   height: 26px;
   padding: 0;
 }
 
-.editor header #editor-save .ico,
-.editor header #editor-close .ico {
+.editor-toolbar .editor-save .ico {
   width: 14px;
   height: 14px;
 }
 
-#editor-path {
+.editor-path {
   color: var(--fg);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-#editor {
+.editor-state {
+  white-space: nowrap;
+}
+
+.editor-body {
+  display: flex;
   flex: 1 1 auto;
+  min-height: 0;
+  background: var(--bg);
+}
+
+.editor-gutter {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 12px 8px 12px 12px;
+  overflow: hidden;
+  border-right: 1px solid var(--line);
+  background: var(--bg);
+  color: #5f6880;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+  text-align: right;
+  user-select: none;
+}
+
+.editor-text {
+  flex: 1 1 auto;
+  min-width: 0;
   min-height: 0;
   width: 100%;
   resize: none;
@@ -919,11 +961,10 @@ button.icon {
   tab-size: 4;
 }
 
-.editor footer {
-  padding: 6px 12px;
-  border-top: 1px solid var(--line);
-  font-size: 11px;
-  color: var(--dim);
+/* 未保存的编辑页在标签上留一个标记，切走后也能看到。 */
+.tab.dirty .tab-label::after {
+  content: " *";
+  color: var(--accent);
 }
 
 @media (max-width: 820px) {
@@ -931,19 +972,17 @@ button.icon {
     display: none;
   }
 
-  .editor header {
+  .editor-toolbar {
     gap: 6px;
     padding: 6px 8px;
   }
 
-  .editor header #editor-save,
-  .editor header #editor-close {
+  .editor-toolbar .editor-save {
     width: 32px;
     height: 32px;
   }
 
-  .editor header #editor-save .ico,
-  .editor header #editor-close .ico {
+  .editor-toolbar .editor-save .ico {
     width: 15px;
     height: 15px;
   }
@@ -1292,34 +1331,6 @@ button.icon {
   height: 8px;
   cursor: row-resize;
   transform: translateY(-50%);
-}
-
-/* --------------------------------------------------------- editor gutter */
-
-.editor-body {
-  display: flex;
-  flex: 1 1 auto;
-  min-height: 0;
-  background: var(--bg);
-}
-
-#editor-gutter {
-  flex: 0 0 auto;
-  margin: 0;
-  padding: 12px 8px 12px 12px;
-  overflow: hidden;
-  border-right: 1px solid var(--line);
-  background: var(--bg);
-  color: #5f6880;
-  font: inherit;
-  font-size: 13px;
-  line-height: 1.5;
-  text-align: right;
-  user-select: none;
-}
-
-#editor {
-  padding: 12px 14px;
 }
 
 #file-list .entry.drop-target {

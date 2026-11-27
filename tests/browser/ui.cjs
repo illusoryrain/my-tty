@@ -74,14 +74,20 @@ const ROOT_NAME = path.basename(ROOT);
   );
   await page.locator("#file-list .entry.file", { hasText: "edit-me.txt" }).waitFor();
   await page.locator("#file-list .entry.file", { hasText: "edit-me.txt" }).locator(".name").click();
-  await page.waitForSelector("#editor-overlay:not([hidden])");
-  assert((await page.locator("#editor-save svg").count()) === 1, "editor save uses an svg icon");
-  assert((await page.locator("#editor-close svg").count()) === 1, "editor close uses an svg icon");
-  await page.fill("#editor", "edited from browser\nsecond line\n");
+  await page.waitForFunction(() => {
+    const el = document.querySelector(".tab-workspace:not([hidden]) .editor-text");
+    return !!el && !el.readOnly;
+  });
+  assert(
+    (await page.locator(".tab-workspace:not([hidden]) .editor-save svg").count()) === 1,
+    "editor save uses an svg icon"
+  );
+  await page.fill(".tab-workspace:not([hidden]) .editor-text", "edited from browser\nsecond line\n");
   await page.keyboard.press("Control+KeyS");
   await page.waitForTimeout(800);
   assert(fs.readFileSync(path.join(ROOT, "edit-me.txt"), "utf8") === "edited from browser\nsecond line\n", "editor saved");
   await page.keyboard.press("Escape");
+  await page.waitForFunction(() => !document.querySelector(".tab-workspace:not([hidden]) .editor-text"));
 
   // 移动端只保留底部按键条里的一个 ^C。
   await page.setViewportSize({ width: 390, height: 800 });

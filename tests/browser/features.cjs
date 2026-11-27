@@ -195,12 +195,29 @@ const ROOT_NAME = path.basename(ROOT);
   );
   await page.locator("#file-list .entry.file", { hasText: "lines.txt" }).waitFor();
   await page.locator("#file-list .entry.file", { hasText: "lines.txt" }).locator(".name").click();
-  await page.waitForSelector("#editor-overlay:not([hidden])");
-  assert((await page.textContent("#editor-gutter")).trim().split("\n").length === 3, "gutter lines");
-  await page.evaluate(() => { const el = document.querySelector("#editor"); el.focus(); el.setSelectionRange(3, 3); });
+  await page.waitForFunction(() => {
+    const el = document.querySelector(".tab-workspace:not([hidden]) .editor-text");
+    return !!el && !el.readOnly;
+  });
+  assert(
+    (await page.textContent(".tab-workspace:not([hidden]) .editor-gutter")).trim().split("\n").length === 3,
+    "gutter lines"
+  );
+  await page.evaluate(() => {
+    const el = document.querySelector(".tab-workspace:not([hidden]) .editor-text");
+    el.focus();
+    el.setSelectionRange(3, 3);
+  });
   await page.keyboard.press("Tab");
-  assert((await page.inputValue("#editor")).split("\n")[0].endsWith("  "), "tab indents");
+  assert(
+    (await page.inputValue(".tab-workspace:not([hidden]) .editor-text")).split("\n")[0].endsWith("  "),
+    "tab indents"
+  );
+  // Tab 缩进把文件改脏了，Esc 关闭会先弹“放弃未保存的修改”。
   await page.keyboard.press("Escape");
+  await page.waitForSelector("#prompt-overlay:not([hidden])");
+  await page.click("#prompt-ok");
+  await page.waitForFunction(() => !document.querySelector(".tab-workspace:not([hidden]) .editor-text"));
 
   assert(errors.length === 0, "console errors: " + errors.join(" | "));
   console.log("features: PASS");
