@@ -1550,6 +1550,7 @@
       } else {
         treeExpanded.delete(item.dir);
         treeChildren.delete(item.dir);
+        treeDirty = true;
       }
       notice(
         item.err.code === "not_found"
@@ -1598,6 +1599,7 @@
   }
 
   function expandPath(path) {
+    treeDirty = true;
     treeExpanded.add("");
     let acc = "";
     for (const part of path.split("/")) {
@@ -1637,7 +1639,6 @@
       const entries = data.entries.filter((entry) => entry.name !== name);
       if (entries.length !== data.entries.length) {
         treeChildren.set(parent, { entries, truncated: data.truncated });
-        treeDirty = true;
       }
     }
     dropTreePath(path);
@@ -1722,6 +1723,7 @@
   }
 
   function toggleDir(path) {
+    treeDirty = true;
     if (treeExpanded.has(path)) {
       treeExpanded.delete(path);
       renderTree();
@@ -1733,6 +1735,7 @@
   }
 
   function dropTreePath(path) {
+    treeDirty = true;
     for (const p of [...treeExpanded]) {
       if (p === path || p.startsWith(`${path}/`)) treeExpanded.delete(p);
     }
@@ -1745,6 +1748,7 @@
   }
 
   function rebaseTree(oldPath, newPath) {
+    treeDirty = true;
     const mapped = (p) =>
       p === oldPath
         ? newPath
@@ -1811,8 +1815,8 @@
   /// 一次 cd 会同时加载 /、/tmp、/tmp/x… 多个目录，旧代码每加载完一个就整树
   /// 重建一次；几千项的目录会因此重绘五到九次。这里用 20ms 防抖合并成一次。
   let renderTimer = null;
-  /// 树的内容是否真的变了；批量的 force 重读如果内容没变就不再整树重建。
-  let treeDirty = false;
+  /// 树的内容是否真的变了；flatRows 和已渲染的树都以它为唯一失效标志。
+  let treeDirty = true;
   function scheduleRender() {
     if (renderTimer) clearTimeout(renderTimer);
     renderTimer = setTimeout(() => {
@@ -1835,9 +1839,8 @@
   // 几十行，滚动时换窗口，总高度用上下两个等高占位行撑起来。
   // ---------------------------------------------------------------------
 
-  /// 展开后的可见行；只在 treeChildren/treeExpanded 变化时重建。
+  /// 展开后的可见行；treeDirty 为真时重建。
   let flatRows = [];
-  let flatDirty = true;
   let windowStart = -1;
   let windowEnd = -1;
 
@@ -1847,8 +1850,8 @@
   }
 
   function ensureFlat() {
-    if (!flatDirty) return;
-    flatDirty = false;
+    if (!treeDirty) return;
+    treeDirty = false;
     const rows = [];
     const root = treeChildren.get("");
     if (!root) {
@@ -1905,7 +1908,6 @@
   }
 
   function renderTree() {
-    treeDirty = false;
     // 结构变化会改变视口上方的行数（例如另一个大目录的列表晚到），只保留
     // scrollTop 会让内容整体跳走。选中行还在视口附近时，记住它当时的位置，
     // 重建后按新下标补回去。
@@ -1913,7 +1915,6 @@
     const oldIndex = selectedIndex();
     const offset = oldIndex >= 0 ? oldIndex * rowHeight - fileList.scrollTop : 0;
     const visible = oldIndex >= 0 && offset >= -rowHeight && offset <= fileList.clientHeight;
-    flatDirty = true;
     ensureFlat();
     if (visible) {
       const newIndex = selectedIndex();
@@ -2278,7 +2279,10 @@
       if (batch.cancelled) notice("上传已取消", true);
       else if (failed === 0) notice(`已上传 ${done} 个文件`);
       else if (done > 0) notice(`上传完成 ${done} 个，失败 ${failed} 个`, true);
-      if (targetDir) treeExpanded.add(targetDir);
+      if (targetDir) {
+        treeExpanded.add(targetDir);
+        treeDirty = true;
+      }
       refreshFiles([targetDir]);
     }
   }
