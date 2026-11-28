@@ -70,9 +70,3 @@ fn handleRequest(io: Io, gpa: Allocator, arena: Allocator, request: *http.Server
     }
     return respond.fail(request, arena, .not_found, "not_found");
 }
-
-/// 取 query 参数并按 urlencoded 解码（`+` = 空格，`%XX`）。编码非法时按空串处理，
-/// 由各接口返回 invalid_path / invalid_id 之类的参数错误。
-fn param(arena: Allocator, request: *http.Server.Request, key: []const u8) util.DecodeError![]const u8 {
-    return (try util.queryParamDecoded(arena, request.head.target, key)) orelse "";
-}

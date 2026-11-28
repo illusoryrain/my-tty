@@ -27,7 +27,7 @@ jobs:
         with:
           node-version-file: .nvmrc
       - name: format
-        run: zig fmt --check build.zig src/*.zig web/embed.zig
+        run: zig fmt --check build.zig src web/embed.zig
       - name: script syntax
         run: |
           cat web/js/*.js | node --check

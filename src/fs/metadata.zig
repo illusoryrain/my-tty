@@ -172,7 +172,6 @@ fn applyMeta(io: Io, file: std.Io.File, meta: FileMeta) !void {
         return error.MetadataUnsafe;
 }
 
-/// 只规范化父目录，不解析最后一段。delete/rename 用它来操作符号链接本身，
 fn le16(bytes: []const u8) u16 {
     return @as(u16, bytes[0]) | (@as(u16, bytes[1]) << 8);
 }

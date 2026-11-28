@@ -22,10 +22,8 @@ pub fn killSessionProcesses(io: Io, sid: posix.pid_t) void {
         const pid = std.fmt.parseInt(posix.pid_t, entry.name, 10) catch continue;
         if (pid <= 1 or pid == sid) continue;
 
-        var path_buf: [64]u8 = undefined;
-        const path_raw = std.fmt.bufPrint(&path_buf, "/proc/{s}/stat", .{entry.name}) catch continue;
-        path_buf[path_raw.len] = 0;
-        const path = path_buf[0..path_raw.len :0];
+        var path_buf: [std.fs.max_name_bytes + 16]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "/proc/{s}/stat", .{entry.name}) catch continue;
         const fd = posix.openat(posix.AT.FDCWD, path, .{
             .ACCMODE = .RDONLY,
             .CLOEXEC = true,
