@@ -2000,6 +2000,14 @@
     try {
       await api("POST", "rename", { from: path, to: newPath });
     } catch (err) {
+      if (err.code === "not_empty") {
+        notice("重命名失败: 目标目录不是空的", true);
+        return;
+      }
+      if (err.code === "cross_device") {
+        notice("重命名失败: 不能跨文件系统移动", true);
+        return;
+      }
       if (err.code !== "already_exists") {
         notice(`重命名失败: ${err.message}`, true);
         return;
@@ -2335,11 +2343,10 @@
     if (!name) return;
     const path = joinPath(currentDir, name);
     try {
-      const parent = currentDir;
       await api("POST", "mkdir", { path });
-      currentDir = path;
-      treeExpanded.add(path);
-      refreshFiles([parent]);
+      // 允许在名字里输入多级路径；applyDir 会展开并加载所有祖先目录，
+      // 否则新目录在树里不可达。
+      applyDir(path, true, true);
     } catch (err) {
       notice(`新建目录失败: ${err.message}`, true);
     }

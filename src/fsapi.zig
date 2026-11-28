@@ -385,7 +385,7 @@ fn archive(io: Io, arena: Allocator, request: *http.Server.Request) !void {
 
     var name_buf: [512]u8 = undefined;
     const tar_name = std.fmt.bufPrint(&name_buf, "{s}.tar", .{root_name}) catch "archive.tar";
-    var disposition_buf: [1024]u8 = undefined;
+    var disposition_buf: [max_disposition_bytes]u8 = undefined;
     const disposition = contentDisposition(&disposition_buf, tar_name);
 
     var headers = [_]http.Header{
@@ -503,7 +503,7 @@ fn download(io: Io, arena: Allocator, request: *http.Server.Request) !void {
     defer file.close(io);
 
     const name = basename(rel);
-    var disposition_buf: [1024]u8 = undefined;
+    var disposition_buf: [max_disposition_bytes]u8 = undefined;
     const disposition = contentDisposition(&disposition_buf, name);
 
     var headers = [_]http.Header{
@@ -547,6 +547,8 @@ fn isUrlSafe(c: u8) bool {
 }
 
 /// `attachment` + ASCII 回退名 + RFC 5987 的 UTF-8 文件名。
+const max_disposition_bytes = 4 * (std.fs.max_name_bytes + 4) + 64;
+
 fn contentDisposition(buf: []u8, name: []const u8) []const u8 {
     var w: std.Io.Writer = .fixed(buf);
     w.writeAll("attachment; filename=\"") catch return "attachment";
@@ -922,6 +924,8 @@ fn failMapped(request: *http.Server.Request, alloc: Allocator, err: anyerror) an
         error.InvalidPath => fail(request, alloc, .bad_request, "invalid_path"),
         error.FileNotFound => fail(request, alloc, .not_found, "not_found"),
         error.PathAlreadyExists => fail(request, alloc, .conflict, "already_exists"),
+        error.DirNotEmpty => fail(request, alloc, .conflict, "not_empty"),
+        error.CrossDevice => fail(request, alloc, .conflict, "cross_device"),
         error.NotDir => fail(request, alloc, .conflict, "not_a_directory"),
         error.IsDir => fail(request, alloc, .conflict, "is_a_directory"),
         error.AccessDenied => fail(request, alloc, .forbidden, "access_denied"),
@@ -954,6 +958,16 @@ test "content disposition encoding" {
     var buf2: [256]u8 = undefined;
     const cjk = contentDisposition(&buf2, "\u{4e2d}\u{6587}.txt");
     try std.testing.expect(std.mem.indexOf(u8, cjk, "filename*=UTF-8''%E4%B8%AD%E6%96%87.txt") != null);
+}
+
+test "content disposition keeps the longest legal name" {
+    // 255 字节是单个文件名的上限；每个非 ASCII 字节会展开成 3 个字符。
+    var name: [255]u8 = undefined;
+    @memset(&name, 0xE4);
+    var buf: [max_disposition_bytes]u8 = undefined;
+    const out = contentDisposition(&buf, &name);
+    try std.testing.expect(std.mem.indexOf(u8, out, "filename*=UTF-8''") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "%E4") != null);
 }
 
 test "basename" {

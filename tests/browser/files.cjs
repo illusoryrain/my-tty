@@ -170,6 +170,17 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   await page.locator(rowFor(`${ROOT_REL}/ren2/sub`)).waitFor({ state: "visible", timeout: 8000 });
   await page.locator(rowFor(`${ROOT_REL}/ren2/sub/kept.txt`)).waitFor({ state: "visible", timeout: 8000 });
 
+  // 新建目录允许输入多级路径：树必须展开并加载祖先，让新目录可达。
+  await page.click("#files-new-dir");
+  await page.waitForSelector("#prompt-overlay:not([hidden])");
+  await page.fill("#prompt-input", "nested/inner");
+  await page.click("#prompt-ok");
+  await page.waitForFunction(() => {
+    const el = document.querySelector("#crumb button.active");
+    return !!el && el.textContent === "inner";
+  });
+  await page.locator(rowFor(`${ROOT_REL}/nested/inner`)).waitFor({ state: "visible", timeout: 8000 });
+
   const leftovers = fs.readdirSync(ROOT).filter((n) => n.startsWith(".myty-upload-"));
   assert(leftovers.length === 0, "no temp files");
   assert(errors.length === 0, "console errors: " + errors.join(" | "));

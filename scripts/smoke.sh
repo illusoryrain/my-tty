@@ -146,6 +146,18 @@ code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST -b "$COOKIE_JAR" \
 [ -f "$ROOT/a.txt" ]
 pass "rename does not overwrite existing target"
 
+# 覆盖一个非空目录必须返回 409，而不是把用户操作错误报成 500。
+mkdir -p "$ROOT/ren-src" "$ROOT/ren-dst"
+printf 'x' >"$ROOT/ren-src/x.txt"
+printf 'y' >"$ROOT/ren-dst/y.txt"
+code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST -b "$COOKIE_JAR" \
+  "$API/rename?from=$REL/ren-src&to=$REL/ren-dst&overwrite=1")
+[ "$code" = "409" ]
+[ "$(cat "$ROOT/ren-src/x.txt")" = "x" ]
+[ "$(cat "$ROOT/ren-dst/y.txt")" = "y" ]
+pass "rename over non-empty directory reports conflict"
+rm -rf "$ROOT/ren-src" "$ROOT/ren-dst"
+
 # FIFO/设备节点不能让服务端卡在 open()，也不能被原子替换成普通文件。
 mkfifo "$ROOT/fifo"
 for endpoint in write upload; do
