@@ -67,6 +67,16 @@ const assert = (c, m) => { if (!c) throw new Error("ASSERT: " + m); };
     return !!el && el.textContent.includes("cwd-sub");
   });
 
+  // 在 shell 当前目录里创建文件后回车：不需要手动刷新也应该出现。
+  const shellFile = "created-in-shell.txt";
+  await page.locator(".pane-term").click();
+  await page.keyboard.type(`touch '${shellFile}'\r`);
+  await waitFor(
+    "shell-created file row",
+    (rel) => !!document.querySelector(`#file-list .entry[data-path="${rel}"]`),
+    `${sub.replace(/^\/+/, "")}/${shellFile}`
+  );
+
   // 手动把文件树切回根目录，再执行 pwd：树应重新跳到 shell 的 cwd。
   await page.locator("#crumb button").first().click();
   await waitCrumb("/");

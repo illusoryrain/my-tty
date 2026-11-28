@@ -225,6 +225,7 @@ fn installSignalHandlers() void {
 pub fn run(io: Io, gpa: Allocator, cfg: *const config.Config) !void {
     var auth_state = auth.Auth.init(io, cfg.password orelse unreachable, cfg.session_ttl_days, cfg.session_idle_hours);
     var manager = session.Manager.init(io, gpa, cfg);
+    manager.auth_state = &auth_state;
     defer manager.deinit();
 
     const addr = try net.IpAddress.parseIp4(cfg.host, cfg.port);
@@ -499,6 +500,12 @@ fn handleHttp(
         return respond(request, "method not allowed\n", .method_not_allowed);
     }
 
+    // 静态资源是公开入口，而且体积可能很大；客户端只收响应头、不读 body 时
+    // 会永久占住连接线程（接收窗口为 0 时 TCP keepalive 也救不了）。给整个
+    // 响应一个总时限，超时由维护线程 shutdown 唤醒阻塞的写操作。
+    connSetDeadline(io, fd, 60);
+    defer connClearDeadline(io, fd);
+
     if (std.mem.eql(u8, path, "/favicon.ico")) {
         return respond(request, "", .no_content);
     }
@@ -637,7 +644,7 @@ fn handleLogout(
     // 先注销 HTTP 会话，再关闭这个会话已经升级的 WebSocket。
     // 否则另一个标签页/脚本里的终端在登出后仍然能继续执行命令。
     if (auth.cookieFromRequest(request)) |cookie| {
-        if (auth_state.logout(cookie)) |session_id| manager.closeAuthSession(session_id);
+        if (auth_state.logout(cookie)) |session_id| manager.revokeAuthSession(session_id);
     }
 
     var cookie_buf: [256]u8 = undefined;

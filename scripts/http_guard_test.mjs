@@ -134,6 +134,36 @@ if (password) {
     assert(res.status === 404, `truncated request must not create ${path}`);
     await fetch(`${base}/api/fs/delete?path=${path}`, { method: "DELETE", headers: { cookie } });
   }
+
+  // 非法百分号编码不能被当成空路径去列根目录；超长路径也不能变成 500。
+  const badList = await exchange(withCookie("GET", "/api/fs/list?path=%zz"));
+  assert(/HTTP\/1\.1 400/.test(badList), "malformed path must be 400");
+  assert(/invalid_query/.test(badList), "malformed path error code");
+  const longPath = "a".repeat(3000);
+  const longOut = await exchange(withCookie("GET", `/api/fs/list?path=${longPath}`));
+  assert(/HTTP\/1\.1 400/.test(longOut), "overlong path must be 400");
+  assert(/path_too_long/.test(longOut), "overlong path error code");
+
+  // 非法的 base 不能绕过并发修改检查。
+  const guardPath = `tmp/mytty-guard-${process.pid}-${Date.now()}`;
+  const put = async (value) => exchange(
+    withCookie("PUT", `/api/fs/write?path=${guardPath}`,
+      `Content-Type: text/plain\r\nContent-Length: ${value.length}\r\n`) + value
+  );
+  assert(/HTTP\/1\.1 200/.test(await put("old")), "guard setup write");
+  const first = await fetch(`${base}/api/fs/read?path=${guardPath}`, { headers: { cookie } });
+  const version = (await first.json()).version;
+  assert(typeof version === "string" && version.length === 16, "guard version");
+  assert(/HTTP\/1\.1 200/.test(await put("changed")), "guard external write");
+  const badBase = await exchange(
+    withCookie("PUT", `/api/fs/write?path=${guardPath}&base=%zz`,
+      "Content-Type: text/plain\r\nContent-Length: 3\r\n") + "bad"
+  );
+  assert(/HTTP\/1\.1 400/.test(badBase), "malformed base must be 400");
+  assert(/invalid_query/.test(badBase), "malformed base error code");
+  const after = await fetch(`${base}/api/fs/read?path=${guardPath}`, { headers: { cookie } });
+  assert((await after.json()).content === "changed", "malformed base must not overwrite");
+  await fetch(`${base}/api/fs/delete?path=${guardPath}`, { method: "DELETE", headers: { cookie } });
 }
 
 console.log("http guard: PASS");

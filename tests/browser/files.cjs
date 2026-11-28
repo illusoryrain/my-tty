@@ -144,6 +144,32 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   assert(fs.statSync(tarPath).size > 512, "tar downloaded");
   assert(tar.suggestedFilename() === "arch.tar", "tar filename");
 
+  // 重命名一个已经展开的目录：已加载的子树要跟着搬走，不能变成“未加载”。
+  fs.mkdirSync(path.join(ROOT, "ren", "sub"), { recursive: true });
+  fs.writeFileSync(path.join(ROOT, "ren", "sub", "kept.txt"), "KEPT");
+  await page.click("#files-refresh");
+  await page.waitForFunction(
+    (rel) => !!document.querySelector(`#file-list .entry[data-path="${rel}"]`),
+    `${ROOT_REL}/ren`
+  );
+  const renRow = page.locator(rowFor(`${ROOT_REL}/ren`));
+  await renRow.locator(".caret").click();
+  await page.locator(rowFor(`${ROOT_REL}/ren/sub`)).waitFor({ state: "visible", timeout: 8000 });
+  await page.locator(rowFor(`${ROOT_REL}/ren/sub`)).locator(".caret").click();
+  await page.locator(rowFor(`${ROOT_REL}/ren/sub/kept.txt`)).waitFor({ state: "visible", timeout: 8000 });
+
+  await renRow.hover();
+  await renRow.locator('button[title="重命名"]').click();
+  await page.waitForSelector("#prompt-overlay:not([hidden])");
+  await page.fill("#prompt-input", "ren2");
+  await page.click("#prompt-ok");
+  await page.waitForFunction(
+    (rel) => !!document.querySelector(`#file-list .entry[data-path="${rel}"]`),
+    `${ROOT_REL}/ren2`
+  );
+  await page.locator(rowFor(`${ROOT_REL}/ren2/sub`)).waitFor({ state: "visible", timeout: 8000 });
+  await page.locator(rowFor(`${ROOT_REL}/ren2/sub/kept.txt`)).waitFor({ state: "visible", timeout: 8000 });
+
   const leftovers = fs.readdirSync(ROOT).filter((n) => n.startsWith(".myty-upload-"));
   assert(leftovers.length === 0, "no temp files");
   assert(errors.length === 0, "console errors: " + errors.join(" | "));

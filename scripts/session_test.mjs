@@ -97,11 +97,21 @@ const t1 = await ticket();
 const t2 = await ticket();
 const live = new WebSocket(`${base.replace(/^http/, "ws")}/ws?ticket=${encodeURIComponent(t1)}`);
 let liveClosed = false;
+let liveSession = "";
 live.addEventListener("close", () => { liveClosed = true; });
+live.addEventListener("message", (event) => {
+  if (typeof event.data !== "string") return;
+  try {
+    const msg = JSON.parse(event.data);
+    if (msg.t === "ready" && typeof msg.session === "string") liveSession = msg.session;
+  } catch (_) {}
+});
 await new Promise((res, rej) => {
   live.addEventListener("open", res, { once: true });
   live.addEventListener("error", () => rej(new Error("logout websocket failed to open")), { once: true });
 });
+for (let i = 0; i < 100 && !liveSession; i++) await sleep(20);
+if (!liveSession) throw new Error("no logout session id");
 await sleep(200);
 const logout = await fetch(`${base}/api/auth/logout`, { method: "POST", headers: { cookie } });
 if (logout.status !== 200) throw new Error("logout failed: " + logout.status);
@@ -119,6 +129,41 @@ try { stale.close(); } catch {}
 if (staleOpened) throw new Error("ticket issued before logout still opened a terminal");
 const status = await fetch(`${base}/api/auth/status`, { headers: { cookie } });
 if (status.status !== 401) throw new Error("session still active after logout: " + status.status);
+
+// 注销后重新登录，旧 session id 必须得到新 shell，不能接回注销前的终端。
+const relogin = await fetch(`${base}/api/auth/login`, {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ password }),
+});
+if (!relogin.ok) throw new Error("relogin failed: " + relogin.status);
+const newCookie = (relogin.headers.getSetCookie && relogin.headers.getSetCookie()[0] ||
+  relogin.headers.get("set-cookie") || "").split(";")[0];
+const newTicketRes = await fetch(`${base}/api/auth/ticket`, { method: "POST", headers: { cookie: newCookie } });
+if (!newTicketRes.ok) throw new Error("relogin ticket failed: " + newTicketRes.status);
+const newTicket = (await newTicketRes.json()).ticket;
+const oldSid = new WebSocket(
+  `${base.replace(/^http/, "ws")}/ws?ticket=${encodeURIComponent(newTicket)}&session=${encodeURIComponent(liveSession)}`
+);
+let oldSidSession = "";
+await new Promise((res, rej) => {
+  const timer = setTimeout(() => rej(new Error("old session probe timeout")), 5000);
+  oldSid.addEventListener("message", (event) => {
+    if (typeof event.data !== "string") return;
+    try {
+      const msg = JSON.parse(event.data);
+      if (msg.t === "ready" && typeof msg.session === "string") {
+        oldSidSession = msg.session;
+        clearTimeout(timer);
+        res();
+      }
+    } catch (_) {}
+  });
+  oldSid.addEventListener("error", () => rej(new Error("old session probe error")), { once: true });
+});
+if (oldSidSession === liveSession) throw new Error("old session reattached after logout");
+oldSid.send(JSON.stringify({ t: "close" }));
+oldSid.close();
 
 console.log("session smoke: PASS");
 process.exit(0);

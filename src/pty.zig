@@ -183,7 +183,8 @@ const EnvBuilder = struct {
             const text = std.mem.span(entry);
             const eq = std.mem.indexOfScalar(u8, text, '=') orelse continue;
             const key = text[0..eq];
-            if (std.mem.eql(u8, key, "HOME") or
+            if (isServerSecret(key) or
+                std.mem.eql(u8, key, "HOME") or
                 std.mem.eql(u8, key, "SHELL") or
                 std.mem.eql(u8, key, "TERM") or
                 std.mem.eql(u8, key, "COLORTERM") or
@@ -196,9 +197,10 @@ const EnvBuilder = struct {
         }
 
         if (!self.hasKey("PATH")) try self.addPair("PATH", default_path);
-        self.addEnvironmentFile(io) catch {};
+        // 固定值必须先放进去，/etc/environment 才不会补出第二个 TERM/COLORTERM。
         try self.addPair("TERM", "xterm-256color");
         try self.addPair("COLORTERM", "truecolor");
+        self.addEnvironmentFile(io) catch {};
         if (!self.hasKey("LANG") and !self.hasKey("LC_ALL")) try self.addPair("LANG", "C.UTF-8");
         self.slots[self.n] = null;
     }
@@ -210,7 +212,7 @@ const EnvBuilder = struct {
         var it = std.mem.splitScalar(u8, data, '\n');
         while (it.next()) |line| {
             const pair = parseEnvLine(line) orelse continue;
-            if (self.hasKey(pair.key)) continue;
+            if (isServerSecret(pair.key) or self.hasKey(pair.key)) continue;
             try self.addPair(pair.key, pair.value);
         }
     }
@@ -302,6 +304,12 @@ fn parseEnvLine(line_raw: []const u8) ?EnvPair {
     return .{ .key = key, .value = value };
 }
 
+/// 服务端自己的凭据不能出现在用户 shell 的环境里；否则 `env` 或任何子进程
+/// 都能直接读到登录密码。配置文件路径等非机密变量仍可继承。
+fn isServerSecret(key: []const u8) bool {
+    return std.mem.eql(u8, key, "MYTTY_PASSWORD");
+}
+
 fn isEnvName(key: []const u8) bool {
     if (key.len == 0) return false;
     if (!std.ascii.isAlphabetic(key[0]) and key[0] != '_') return false;
@@ -375,8 +383,8 @@ test "env builder overrides identity and terminal variables" {
     defer env.deinit();
 
     // 手工构造一个 HOME 不对、TERM 也不对的环境。
-    const fake = [_]?[*:0]const u8{ "TERM=dumb", "HOME=/wrong", "PATH=/bin", "CUSTOM=keep", null };
-    const block: std.process.Environ.Block = .{ .slice = fake[0..4 :null] };
+    const fake = [_]?[*:0]const u8{ "TERM=dumb", "HOME=/wrong", "PATH=/bin", "CUSTOM=keep", "MYTTY_PASSWORD=secret", null };
+    const block: std.process.Environ.Block = .{ .slice = fake[0..5 :null] };
     const environ: std.process.Environ = .{ .block = block };
 
     try env.build(std.testing.io, null, "/home/tester", "/bin/bash", environ);
@@ -396,6 +404,7 @@ test "env builder overrides identity and terminal variables" {
         if (std.mem.eql(u8, text, "COLORTERM=truecolor")) saw_colorterm = true;
         try std.testing.expect(!std.mem.eql(u8, text, "HOME=/wrong"));
         try std.testing.expect(!std.mem.eql(u8, text, "TERM=dumb"));
+        try std.testing.expect(!std.mem.startsWith(u8, text, "MYTTY_PASSWORD="));
     }
     try std.testing.expect(saw_home and saw_shell and saw_custom and saw_term and saw_colorterm);
 }

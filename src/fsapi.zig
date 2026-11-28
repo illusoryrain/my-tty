@@ -36,6 +36,14 @@ pub fn handle(io: Io, gpa: Allocator, request: *http.Server.Request) !void {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    return handleRequest(io, gpa, arena, request) catch |err| switch (err) {
+        error.InvalidEncoding => fail(request, arena, .bad_request, "invalid_query"),
+        error.OutOfMemory => fail(request, arena, .internal_server_error, "out_of_memory"),
+        else => return err,
+    };
+}
+
+fn handleRequest(io: Io, gpa: Allocator, arena: Allocator, request: *http.Server.Request) !void {
     const target = request.head.target;
     const path = util.pathOnly(target);
 
@@ -66,7 +74,7 @@ pub fn handle(io: Io, gpa: Allocator, request: *http.Server.Request) !void {
     if (std.mem.eql(u8, path, "/api/fs/upload")) {
         if (request.head.method != .PUT)
             return fail(request, arena, .method_not_allowed, "method_not_allowed");
-        return uploadSingle(io, arena, normalized(arena, param(arena, request, "path")) catch
+        return uploadSingle(io, arena, normalized(arena, try param(arena, request, "path")) catch
             return fail(request, arena, .bad_request, "invalid_path"), request);
     }
     if (std.mem.eql(u8, path, "/api/fs/archive")) {
@@ -82,12 +90,12 @@ pub fn handle(io: Io, gpa: Allocator, request: *http.Server.Request) !void {
 
 /// 取 query 参数并按 urlencoded 解码（`+` = 空格，`%XX`）。编码非法时按空串处理，
 /// 由各接口返回 invalid_path / invalid_id 之类的参数错误。
-fn param(arena: Allocator, request: *http.Server.Request, key: []const u8) []const u8 {
-    return (util.queryParamDecoded(arena, request.head.target, key) catch null) orelse "";
+fn param(arena: Allocator, request: *http.Server.Request, key: []const u8) util.DecodeError![]const u8 {
+    return (try util.queryParamDecoded(arena, request.head.target, key)) orelse "";
 }
 
 fn list(io: Io, arena: Allocator, request: *http.Server.Request) !void {
-    const rel = normalized(arena, param(arena, request, "path")) catch
+    const rel = normalized(arena, try param(arena, request, "path")) catch
         return fail(request, arena, .bad_request, "invalid_path");
     const abs = resolveExisting(io, arena, rel) catch |err| return failMapped(request, arena, err);
 
@@ -140,7 +148,7 @@ fn list(io: Io, arena: Allocator, request: *http.Server.Request) !void {
 }
 
 fn read(io: Io, arena: Allocator, request: *http.Server.Request) !void {
-    const rel = normalized(arena, param(arena, request, "path")) catch
+    const rel = normalized(arena, try param(arena, request, "path")) catch
         return fail(request, arena, .bad_request, "invalid_path");
     if (rel.len == 0) return fail(request, arena, .bad_request, "invalid_path");
     const abs = resolveExisting(io, arena, rel) catch |err| return failMapped(request, arena, err);
@@ -183,12 +191,12 @@ fn baseMatches(io: Io, arena: Allocator, abs: []const u8, base: []const u8) !boo
 }
 
 fn write(io: Io, gpa: Allocator, arena: Allocator, request: *http.Server.Request) !void {
-    const rel = normalized(arena, param(arena, request, "path")) catch
+    const rel = normalized(arena, try param(arena, request, "path")) catch
         return fail(request, arena, .bad_request, "invalid_path");
     if (rel.len == 0) return fail(request, arena, .bad_request, "invalid_path");
     // 读 body 之后 request.head（含 target）就失效了，所有 query 参数必须先取出来。
-    const base = param(arena, request, "base");
-    const exclusive = std.mem.eql(u8, param(arena, request, "exclusive"), "1");
+    const base = try param(arena, request, "base");
+    const exclusive = std.mem.eql(u8, try param(arena, request, "exclusive"), "1");
     if (!util.requestDeclaresBody(request))
         return fail(request, arena, .length_required, "length_required");
 
@@ -244,7 +252,7 @@ fn write(io: Io, gpa: Allocator, arena: Allocator, request: *http.Server.Request
 }
 
 fn makeDir(io: Io, arena: Allocator, request: *http.Server.Request) !void {
-    const rel = normalized(arena, param(arena, request, "path")) catch
+    const rel = normalized(arena, try param(arena, request, "path")) catch
         return fail(request, arena, .bad_request, "invalid_path");
     if (rel.len == 0) return fail(request, arena, .bad_request, "invalid_path");
     const abs = joinAbs(arena, "/", rel) catch |err| return failMapped(request, arena, err);
@@ -259,12 +267,12 @@ fn makeDir(io: Io, arena: Allocator, request: *http.Server.Request) !void {
 }
 
 fn rename(io: Io, arena: Allocator, request: *http.Server.Request) !void {
-    const from_rel = normalized(arena, param(arena, request, "from")) catch
+    const from_rel = normalized(arena, try param(arena, request, "from")) catch
         return fail(request, arena, .bad_request, "invalid_path");
-    const to_rel = normalized(arena, param(arena, request, "to")) catch
+    const to_rel = normalized(arena, try param(arena, request, "to")) catch
         return fail(request, arena, .bad_request, "invalid_path");
     if (from_rel.len == 0 or to_rel.len == 0) return fail(request, arena, .bad_request, "invalid_path");
-    const overwrite = std.mem.eql(u8, param(arena, request, "overwrite"), "1");
+    const overwrite = std.mem.eql(u8, try param(arena, request, "overwrite"), "1");
 
     const from_abs = resolveLeaf(io, arena, from_rel) catch |err| return failMapped(request, arena, err);
     const to_abs = resolveNew(io, arena, to_rel) catch |err| return failMapped(request, arena, err);
@@ -288,7 +296,7 @@ fn rename(io: Io, arena: Allocator, request: *http.Server.Request) !void {
 }
 
 fn delete(io: Io, arena: Allocator, request: *http.Server.Request) !void {
-    const rel = normalized(arena, param(arena, request, "path")) catch
+    const rel = normalized(arena, try param(arena, request, "path")) catch
         return fail(request, arena, .bad_request, "invalid_path");
     if (rel.len == 0) return fail(request, arena, .bad_request, "invalid_path");
     const abs = resolveLeaf(io, arena, rel) catch |err| return failMapped(request, arena, err);
@@ -365,7 +373,7 @@ fn uploadSingle(io: Io, arena: Allocator, rel: []const u8, request: *http.Server
 }
 
 fn archive(io: Io, arena: Allocator, request: *http.Server.Request) !void {
-    const rel = normalized(arena, param(arena, request, "path")) catch
+    const rel = normalized(arena, try param(arena, request, "path")) catch
         return fail(request, arena, .bad_request, "invalid_path");
     const abs = resolveExisting(io, arena, rel) catch |err| return failMapped(request, arena, err);
     const st = Dir.cwd().statFile(io, abs, .{ .follow_symlinks = false }) catch |err|
@@ -481,7 +489,7 @@ fn walkTar(
 }
 
 fn download(io: Io, arena: Allocator, request: *http.Server.Request) !void {
-    const rel = normalized(arena, param(arena, request, "path")) catch
+    const rel = normalized(arena, try param(arena, request, "path")) catch
         return fail(request, arena, .bad_request, "invalid_path");
     if (rel.len == 0) return fail(request, arena, .bad_request, "invalid_path");
 
@@ -565,6 +573,7 @@ const PathError = error{
     InvalidPath,
     FileNotFound,
     AccessDenied,
+    NameTooLong,
     OutOfMemory,
     IoError,
 };
@@ -584,6 +593,9 @@ fn normalized(alloc: Allocator, raw: []const u8) ![]const u8 {
         if (out.items.len != 0) try out.append(alloc, '/');
         try out.appendSlice(alloc, part);
     }
+    // 前端和 JSON 都按 UTF-8 表示路径；列表已经跳过非 UTF-8 文件名，
+    // 这里也拒绝，避免 API 生成字符串数组形式的 path 或让文件凭空消失。
+    if (!std.unicode.utf8ValidateSlice(out.items)) return error.InvalidPath;
     return try alloc.dupe(u8, out.items);
 }
 
@@ -598,7 +610,9 @@ fn resolveExisting(io: Io, alloc: Allocator, rel: []const u8) PathError![:0]u8 {
     const joined = joinAbs(alloc, "/", rel) catch return error.OutOfMemory;
     return Dir.cwd().realPathFileAlloc(io, joined, alloc) catch |err| switch (err) {
         error.FileNotFound => error.FileNotFound,
-        error.AccessDenied => error.AccessDenied,
+        error.AccessDenied, error.PermissionDenied => error.AccessDenied,
+        error.NameTooLong => error.NameTooLong,
+        error.NotDir, error.SymLinkLoop, error.BadPathName => error.InvalidPath,
         error.OutOfMemory => error.OutOfMemory,
         else => error.IoError,
     };
@@ -911,6 +925,7 @@ fn failMapped(request: *http.Server.Request, alloc: Allocator, err: anyerror) an
         error.NotDir => fail(request, alloc, .conflict, "not_a_directory"),
         error.IsDir => fail(request, alloc, .conflict, "is_a_directory"),
         error.AccessDenied => fail(request, alloc, .forbidden, "access_denied"),
+        error.NameTooLong => fail(request, alloc, .bad_request, "path_too_long"),
         error.OutOfMemory => fail(request, alloc, .internal_server_error, "out_of_memory"),
         else => fail(request, alloc, .internal_server_error, "io_error"),
     };
@@ -928,6 +943,7 @@ test "normalized rejects traversal and absolute paths" {
     try std.testing.expectError(error.InvalidPath, normalized(a, "../etc"));
     try std.testing.expectError(error.InvalidPath, normalized(a, "a/../../b"));
     try std.testing.expectError(error.InvalidPath, normalized(a, "/etc/passwd"));
+    try std.testing.expectError(error.InvalidPath, normalized(a, "bad\xffname"));
 }
 
 test "content disposition encoding" {

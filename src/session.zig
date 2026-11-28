@@ -61,6 +61,9 @@ pub const Attachment = struct {
     writer: ?std.Thread = null,
 
     const max_out_bytes: usize = 1024 * 1024;
+    /// 字节数管不住空帧：一条 0 字节 ping 只占队列项。限制帧数，避免慢客户端
+    /// 用海量 ping 把内存堆到几百 MB。
+    const max_out_frames: usize = 1024;
     const Frame = struct {
         data: []u8,
         op: http.Server.WebSocket.Opcode,
@@ -81,7 +84,9 @@ pub const Attachment = struct {
             thread.join();
             self.writer = null;
         }
-        self.dropQueued();
+        // 队列本身也要释放：每个连接一条，只 clearRetainingCapacity 会永久
+        // 留下这块容量（空 ping 还会不断扩容）。
+        self.deinitQueue();
     }
 
     fn dropQueued(self: *Attachment) void {
@@ -92,11 +97,21 @@ pub const Attachment = struct {
         self.out_bytes = 0;
     }
 
+    fn deinitQueue(self: *Attachment) void {
+        self.out_mutex.lockUncancelable(self.io);
+        defer self.out_mutex.unlock(self.io);
+        for (self.out_queue.items) |frame| self.gpa.free(frame.data);
+        self.out_queue.deinit(self.gpa);
+        self.out_queue = .empty;
+        self.out_bytes = 0;
+    }
+
     fn sendRaw(self: *Attachment, data: []const u8, op: http.Server.WebSocket.Opcode) !void {
         if (!self.alive.load(.acquire)) return error.Closed;
         self.out_mutex.lockUncancelable(self.io);
         defer self.out_mutex.unlock(self.io);
         if (self.out_closed) return error.Closed;
+        if (self.out_queue.items.len >= max_out_frames) return error.QueueFull;
         if (self.out_bytes + data.len > max_out_bytes) return error.QueueFull;
         const copy = self.gpa.dupe(u8, data) catch return error.OutOfMemory;
         self.out_queue.append(self.gpa, .{ .data = copy, .op = op }) catch {
@@ -168,6 +183,8 @@ pub const Manager = struct {
     io: Io,
     gpa: Allocator,
     cfg: *const config.Config,
+    /// 登录会话校验由 server 在启动时绑定；单元测试里的 Manager 不需要。
+    auth_state: ?*auth.Auth = null,
     mutex: Io.Mutex = .init,
     sessions: std.ArrayList(*Session) = .empty,
     /// 被接管、但还没 detach 的旧前端。写线程如果卡住，由 sweep 在 2 秒后
@@ -229,43 +246,61 @@ pub const Manager = struct {
         att.stream.shutdown(self.io, .both) catch {};
     }
 
-    /// 注销某个登录会话时立即关闭它建立的所有终端 WebSocket。
-    pub fn closeAuthSession(self: *Manager, session_id: [16]u8) void {
+    /// 注销/过期时结束一个登录会话拥有的全部终端：关闭前端并杀掉 shell。
+    /// 不能只关 WebSocket：否则旧 shell 会继续运行，而且新登录只要拿到旧的
+    /// session id 就还能接回它（session id 也会出现在代理日志的 URL 里）。
+    pub fn revokeAuthSession(self: *Manager, session_id: [16]u8) void {
+        self.revokeSessions(session_id, null);
+    }
+
+    /// 定期复查登录会话。会话过期/被淘汰后，终端也必须跟着结束。
+    pub fn enforceAuth(self: *Manager, auth_state: *auth.Auth) void {
+        self.revokeSessions(null, auth_state);
+    }
+
+    fn revokeSessions(
+        self: *Manager,
+        owner: ?[16]u8,
+        auth_state: ?*auth.Auth,
+    ) void {
         self.mutex.lockUncancelable(self.io);
-        for (self.sessions.items) |s| {
+        var i: usize = 0;
+        while (i < self.sessions.items.len) {
+            const s = self.sessions.items[i];
             s.mutex.lockUncancelable(self.io);
-            if (s.attachment) |att| {
-                if (std.mem.eql(u8, &att.auth_session, &session_id)) self.shutAttachment(att);
+
+            const revoke = if (owner) |id|
+                std.mem.eql(u8, &s.auth_session, &id)
+            else
+                !(auth_state orelse unreachable).sessionValid(&s.auth_session);
+
+            // 同一轮里可能已经标记过；不要每秒重复扫 /proc、重复杀进程。
+            const first = revoke and !s.closing;
+            if (first) {
+                if (s.attachment) |att| self.shutAttachment(att);
+                s.closing = true;
             }
+            const destroy_now = revoke and s.attachment == null and s.attachments == 0;
             s.mutex.unlock(self.io);
+
+            if (destroy_now) {
+                self.destroyLocked(s);
+            } else {
+                if (first) self.stopLocked(s);
+                i += 1;
+            }
         }
         self.mutex.unlock(self.io);
 
+        // 被接管、正在 retire 的旧前端也要按同一个登录会话关掉。
         self.retire_mutex.lockUncancelable(self.io);
         defer self.retire_mutex.unlock(self.io);
         for (self.retiring.items) |r| {
-            if (std.mem.eql(u8, &r.att.auth_session, &session_id)) self.shutAttachment(r.att);
-        }
-    }
-
-    /// 定期复查已升级 WebSocket 绑定的登录会话。HTTP 会话过期/被其他窗口
-    /// 注销后，终端也必须跟着断开；不能只在升级那一刻验一次 Cookie。
-    pub fn enforceAuth(self: *Manager, auth_state: *auth.Auth) void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-
-        for (self.sessions.items) |s| {
-            if (!s.mutex.tryLock()) continue;
-            if (s.attachment) |att| {
-                if (!auth_state.sessionValid(&att.auth_session)) self.shutAttachment(att);
-            }
-            s.mutex.unlock(self.io);
-        }
-
-        self.retire_mutex.lockUncancelable(self.io);
-        defer self.retire_mutex.unlock(self.io);
-        for (self.retiring.items) |r| {
-            if (!auth_state.sessionValid(&r.att.auth_session)) self.shutAttachment(r.att);
+            const revoke = if (owner) |id|
+                std.mem.eql(u8, &r.att.auth_session, &id)
+            else
+                !(auth_state orelse unreachable).sessionValid(&r.att.auth_session);
+            if (revoke) self.shutAttachment(r.att);
         }
     }
 
@@ -295,19 +330,29 @@ pub const Manager = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
+        // 票据/握手可能刚好和注销并发；拿到 manager 锁后再确认一次，避免
+        // 注销流程已经清空会话后又新建一个属于已失效登录会话的 shell。
+        if (self.auth_state) |a| {
+            if (!a.sessionValid(&att.auth_session)) return error.Unauthorized;
+        }
+
         const session = blk: {
             if (session_id) |sid| {
                 if (self.findLocked(sid)) |found| {
                     if (!self.lockSessionBounded(found, 250)) return error.SessionBusy;
+                    // 只有同一个登录会话才能接回已有 shell；注销后重新登录拿着
+                    // 旧 session id 进来时，必须得到一个新会话，不能接管旧 shell。
+                    const owned = std.mem.eql(u8, &found.auth_session, &att.auth_session);
                     // closed/closing 的会话不能再接；但旧前端可能还持有指针。
-                    const reusable = !found.closed and !found.closing;
+                    const reusable = owned and !found.closed and !found.closing;
                     const busy = found.attachment != null or found.attachments > 0;
                     found.mutex.unlock(self.io);
                     if (reusable) break :blk found;
-                    if (!busy) self.destroyLocked(found);
+                    // 只回收自己会话组里已经空闲的旧壳；不能销毁别的登录会话。
+                    if (owned and !busy) self.destroyLocked(found);
                 }
             }
-            break :blk try self.createLocked();
+            break :blk try self.createLocked(att.auth_session);
         };
 
         if (!self.lockSessionBounded(session, 250)) return error.SessionBusy;
@@ -553,7 +598,7 @@ pub const Manager = struct {
         return victim;
     }
 
-    fn createLocked(self: *Manager) !*Session {
+    fn createLocked(self: *Manager, auth_session: [16]u8) !*Session {
         if (self.sessions.items.len >= self.cfg.max_sessions) {
             if (self.evictOneLocked()) |victim| {
                 self.destroyLocked(victim);
@@ -587,6 +632,7 @@ pub const Manager = struct {
         s.* = .{
             .manager = self,
             .id = id,
+            .auth_session = auth_session,
             .master = spawned.master,
             .child = spawned.child,
             .buf = buf,
@@ -704,6 +750,8 @@ fn killSessionProcesses(io: Io, sid: posix.pid_t) void {
 const Session = struct {
     manager: *Manager,
     id: [16]u8,
+    /// 创建这个 shell 的登录会话；注销/过期后整个 shell 一起结束。
+    auth_session: [16]u8 = @splat(0),
     master: posix.fd_t,
     child: posix.pid_t,
     pump_thread: ?std.Thread = null,
@@ -822,7 +870,9 @@ fn relativeCwd(abs_raw: []const u8) ?[]const u8 {
 
 fn sendCwd(att: *Attachment, abs_raw: []const u8) !void {
     const rel = relativeCwd(abs_raw) orelse return;
-    var buf: [std.fs.max_path_bytes * 2 + 64]u8 = undefined;
+    // JSON 会把每个控制字节转义成 6 个字符（`\u00XX`），按 6 倍预留，
+    // 否则合法的控制字符目录名会让序列化失败并误关整个终端连接。
+    var buf: [std.fs.max_path_bytes * 6 + 64]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     const Payload = struct {
         t: []const u8 = "cwd",
@@ -964,10 +1014,15 @@ pub fn serve(
             error.TooManySessions => "{\"t\":\"error\",\"reason\":\"too_many_sessions\"}",
             error.SessionBusy => "{\"t\":\"error\",\"reason\":\"session_busy\"}",
             error.PtySpawnFailed => "{\"t\":\"error\",\"reason\":\"pty_failed\"}",
+            error.Unauthorized => "{\"t\":\"error\",\"reason\":\"unauthorized\"}",
             else => "{\"t\":\"error\"}",
         };
         att.dropQueued();
+        // writerLoop 可能正拿着 send_mutex 写队列里的帧；错误帧必须排队，
+        // 否则两个线程会同时写同一个 WebSocket/Wirer。
+        att.send_mutex.lockUncancelable(io);
         ws.writeMessage(body, .text) catch {};
+        att.send_mutex.unlock(io);
         return err;
     };
     defer manager.detach(&att);
@@ -977,6 +1032,9 @@ pub fn serve(
 
     while (true) {
         const msg = ws.readSmallMessage() catch return;
+        // 注销/接管/认证过期后 socket 可能还有已经读出的消息；不能再让它
+        // 写入共享 PTY，否则旧前端仍能向新前端正在使用的 shell 注入输入。
+        if (!att.alive.load(.acquire)) return;
         switch (msg.opcode) {
             .ping => att.sendRaw(msg.data, .pong) catch return,
             .binary => {
@@ -1166,4 +1224,36 @@ test "session id parsing rejects junk" {
     try std.testing.expectEqual(@as(u64, 123), parseOffset("123"));
     try std.testing.expectEqual(@as(u64, 0), parseOffset("nope"));
     try std.testing.expectEqual(@as(u64, 0), parseOffset(null));
+}
+
+fn testAttachment() Attachment {
+    return .{
+        .io = std.testing.io,
+        .gpa = std.testing.allocator,
+        .ws = undefined,
+        .stream = undefined,
+    };
+}
+
+test "output queue is bounded by frame count as well as bytes" {
+    var att = testAttachment();
+    defer att.deinitQueue();
+
+    var i: usize = 0;
+    while (i < Attachment.max_out_frames) : (i += 1) try att.sendRaw("", .pong);
+    try std.testing.expectError(error.QueueFull, att.sendRaw("", .pong));
+    try std.testing.expectEqual(@as(usize, 0), att.out_bytes);
+    try std.testing.expectEqual(Attachment.max_out_frames, att.out_queue.items.len);
+}
+
+test "cwd control bytes fit the escaped json buffer" {
+    var att = testAttachment();
+    defer att.deinitQueue();
+
+    var path: [2001]u8 = undefined;
+    path[0] = '/';
+    @memset(path[1..], 1);
+    try sendCwd(&att, &path);
+    try std.testing.expectEqual(@as(usize, 1), att.out_queue.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, att.out_queue.items[0].data, "\\u0001") != null);
 }

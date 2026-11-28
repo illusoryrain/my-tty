@@ -868,6 +868,8 @@
       // “登录过期”，避免过期后无限重连。
       try {
         const res = await fetch("/api/auth/status", { cache: "no-store" });
+        if (pane.ws && pane.ws !== ws) return;
+        if (!started || !pane.el.isConnected) return;
         if (res.status === 401) {
           markAuthStopped();
           stopAuthKeepalive();
@@ -875,6 +877,9 @@
           return;
         }
       } catch (_) {}
+      // 状态请求是异步的；期间用户可能已经点了重连并建立了新连接，或者
+      // 已经注销/关闭了分屏。旧连接的收尾不能改动新连接/已移除的分屏。
+      if (pane.ws && pane.ws !== ws) return;
       if (!started || !pane.el.isConnected) return;
       if (pane.retryable) {
         scheduleReconnect(pane);
@@ -1174,7 +1179,11 @@
     const bytes = textEncoder.encode(data);
     const CHUNK = 8192;
     for (let i = 0; i < bytes.length; i += CHUNK) {
-      ws.send(bytes.subarray(i, i + CHUNK));
+      try {
+        ws.send(bytes.subarray(i, i + CHUNK));
+      } catch (_) {
+        return;
+      }
     }
     // 用户执行完一条命令（回车）后主动对一次 cwd：pwd/cd 都能立刻同步文件树，
     // 不需要等服务端 500ms 的轮询。
@@ -1186,7 +1195,9 @@
   function sendResize(pane) {
     const ws = pane.ws;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    ws.send(JSON.stringify({ t: "resize", cols: pane.term.cols, rows: pane.term.rows }));
+    try {
+      ws.send(JSON.stringify({ t: "resize", cols: pane.term.cols, rows: pane.term.rows }));
+    } catch (_) {}
   }
 
   function fitPane(pane) {
@@ -1422,6 +1433,7 @@
   // -------------------------------------------------------------------- files
 
   async function api(method, action, query, body) {
+    const epoch = authEpoch;
     const qs = query ? `?${new URLSearchParams(query)}` : "";
     const headers = {};
     if (body !== undefined) headers["Content-Type"] = "text/plain; charset=utf-8";
@@ -1431,8 +1443,11 @@
       data = await res.json();
     } catch (_) {}
     if (res.status === 401) {
-      markAuthStopped();
-      showLogin("登录已失效，请重新登录");
+      // 请求发出后用户可能已经重新登录；旧的 401 不能把登录框再弹出来。
+      if (epoch === authEpoch) {
+        markAuthStopped();
+        showLogin("登录已失效，请重新登录");
+      }
       throw new Error("unauthorized");
     }
     if (!res.ok) {
@@ -1635,7 +1650,13 @@
   /// shell 的 cwd 变化或用户按回车后，把文件树跳到对应目录。
   /// 强制重读路径上的目录，终端里新建的目录也能立即出现在树里。
   function syncFilesToCwd(path) {
-    if (typeof path !== "string" || path === currentDir) return;
+    if (typeof path !== "string") return;
+    if (path === currentDir) {
+      // 终端里执行 touch/mkdir 后 cwd 不变，但目录内容可能变了；回车会主动
+      // 请求一次 cwd，这里强制重读当前目录，而不是因为路径相同直接返回。
+      if (!filesEl.hidden) ensureTreeLoaded(path, true);
+      return;
+    }
     applyDir(path, true, true);
   }
 
@@ -1676,8 +1697,18 @@
         treeExpanded.add(mapped(p));
       }
     }
-    for (const p of [...treeChildren.keys()]) {
-      if (p === oldPath || p.startsWith(`${oldPath}/`)) treeChildren.delete(p);
+    // 把已经加载过的子树跟着目录一起搬走，否则重命名后展开状态还在、
+    // 子节点却被删掉，界面会显示“未加载”。覆盖目标目录的旧缓存也一并丢弃。
+    // 先删目标、再搬来源：否则来源的缓存可能搬进目标后又被目标清理删掉。
+    const cached = [...treeChildren];
+    for (const [p] of cached) {
+      if (p === newPath || p.startsWith(`${newPath}/`)) treeChildren.delete(p);
+    }
+    for (const [p, data] of cached) {
+      if (p === oldPath || p.startsWith(`${oldPath}/`)) {
+        treeChildren.delete(p);
+        treeChildren.set(mapped(p), data);
+      }
     }
     if (currentDir === oldPath || currentDir.startsWith(`${oldPath}/`)) {
       currentDir = mapped(currentDir);
@@ -2111,15 +2142,17 @@
   // 整文件一次 PUT：服务端写临时文件后原子替换，断线不会留下半截目标文件。
   function uploadOne(file, targetDir, batch) {
     return new Promise((resolve, reject) => {
+      const epoch = authEpoch;
       const xhr = new XMLHttpRequest();
       const url = `/api/fs/upload?path=${encodeURIComponent(joinPath(targetDir, file.name))}`;
       batch.xhr = xhr;
       xhr.open("PUT", url);
       xhr.responseType = "text";
+      const total = file.size || 1; // 0 字节文件也不能让进度变成 NaN%
       xhr.upload.onprogress = (ev) => {
         if (!ev.lengthComputable) return;
-        const pct = Math.round((ev.loaded / file.size) * 100);
-        showUploadProgress(true, ev.loaded / file.size, `${file.name} ${pct}%`);
+        const pct = Math.round((ev.loaded / total) * 100);
+        showUploadProgress(true, ev.loaded / total, `${file.name} ${pct}%`);
       };
       xhr.onload = () => {
         let data = {};
@@ -2128,7 +2161,7 @@
         } catch (_) {}
         if (xhr.status >= 200 && xhr.status < 300) return resolve(data);
         if (xhr.status === 401) {
-          showLogin("登录已失效，请重新登录");
+          if (epoch === authEpoch) showLogin("登录已失效，请重新登录");
           return reject(new Error("unauthorized"));
         }
         reject(new Error(data.error || `HTTP ${xhr.status}`));
@@ -3016,8 +3049,10 @@
   function startAuthKeepalive() {
     if (authCheckTimer) return;
     authCheckTimer = setInterval(async () => {
+      const epoch = authEpoch;
       try {
         const res = await fetch("/api/auth/status", { cache: "no-store" });
+        if (epoch !== authEpoch || !started) return;
         if (res.status === 401) {
           markAuthStopped();
           stopAuthKeepalive();
@@ -3043,12 +3078,13 @@
     try {
       // 状态接口本身也要求认证：401 才是“未登录”。
       const res = await fetch("/api/auth/status", { cache: "no-store" });
+      if (epoch !== authEpoch) return;
       if (res.ok) {
-        if (epoch === authEpoch) startApp();
+        startApp();
         return;
       }
       if (res.status === 401) {
-        showLogin();
+        if (epoch === authEpoch) showLogin();
         return;
       }
       if (attempt < 3) {
@@ -3058,6 +3094,7 @@
       showLogin(`服务端错误（HTTP ${res.status}），正在重试…`);
       setTimeout(() => refreshAuth(0, epoch), 5000);
     } catch (_) {
+      if (epoch !== authEpoch) return;
       // 请求失败可能只是网络还没恢复（手机刚解锁、Wi-Fi 正在重连），
       // 不代表密码失效：自动退避重试，恢复后会直接进入界面。
       if (attempt === 0) showLogin("无法连接服务端，正在自动重试…");
