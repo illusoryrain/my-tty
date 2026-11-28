@@ -14,6 +14,9 @@ test {
     _ = @import("session.zig");
     _ = @import("util.zig");
     _ = @import("auth.zig");
-    _ = @import("fsapi.zig");
+    _ = @import("fs/api.zig");
+    _ = @import("fs/paths.zig");
+    _ = @import("fs/metadata.zig");
+    _ = @import("term/websocket.zig");
     std.testing.refAllDecls(@This());
 }

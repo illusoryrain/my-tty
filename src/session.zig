@@ -29,6 +29,10 @@ const Io = std.Io;
 
 const pty = @import("pty.zig");
 const config = @import("config.zig");
+const process = @import("term/process.zig");
+const ids = @import("term/ids.zig");
+pub const parseSessionId = ids.parseSessionId;
+pub const parseOffset = ids.parseOffset;
 const auth = @import("auth.zig");
 
 const Allocator = std.mem.Allocator;
@@ -69,11 +73,11 @@ pub const Attachment = struct {
         op: http.Server.WebSocket.Opcode,
     };
 
-    fn startWriter(self: *Attachment) !void {
+    pub fn startWriter(self: *Attachment) !void {
         self.writer = try std.Thread.spawn(.{}, writerLoop, .{self});
     }
 
-    fn stopWriter(self: *Attachment) void {
+    pub fn stopWriter(self: *Attachment) void {
         self.out_mutex.lockUncancelable(self.io);
         self.out_closed = true;
         self.out_cond.broadcast(self.io);
@@ -89,7 +93,7 @@ pub const Attachment = struct {
         self.deinitQueue();
     }
 
-    fn dropQueued(self: *Attachment) void {
+    pub fn dropQueued(self: *Attachment) void {
         self.out_mutex.lockUncancelable(self.io);
         defer self.out_mutex.unlock(self.io);
         for (self.out_queue.items) |frame| self.gpa.free(frame.data);
@@ -106,7 +110,7 @@ pub const Attachment = struct {
         self.out_bytes = 0;
     }
 
-    fn sendRaw(self: *Attachment, data: []const u8, op: http.Server.WebSocket.Opcode) !void {
+    pub fn sendRaw(self: *Attachment, data: []const u8, op: http.Server.WebSocket.Opcode) !void {
         if (!self.alive.load(.acquire)) return error.Closed;
         self.out_mutex.lockUncancelable(self.io);
         defer self.out_mutex.unlock(self.io);
@@ -122,7 +126,7 @@ pub const Attachment = struct {
         self.out_cond.signal(self.io);
     }
 
-    fn sendText(self: *Attachment, data: []const u8) !void {
+    pub fn sendText(self: *Attachment, data: []const u8) !void {
         return self.sendRaw(data, .text);
     }
 
@@ -525,7 +529,7 @@ pub const Manager = struct {
         defer self.mutex.unlock(self.io);
         for (self.sessions.items) |s| {
             s.stopping.store(true, .release);
-            killSessionProcesses(self.io, s.child);
+            process.killSessionProcesses(self.io, s.child);
             _ = linux.kill(-s.child, .KILL);
             _ = linux.kill(s.child, .KILL);
         }
@@ -615,13 +619,13 @@ pub const Manager = struct {
         }) catch return error.PtySpawnFailed;
 
         const s = self.gpa.create(Session) catch {
-            killChild(spawned.child);
+            process.killChild(spawned.child);
             _ = linux.close(spawned.master);
             return error.OutOfMemory;
         };
         const buf = self.gpa.alloc(u8, initial_ring_capacity) catch {
             self.gpa.destroy(s);
-            killChild(spawned.child);
+            process.killChild(spawned.child);
             _ = linux.close(spawned.master);
             return error.OutOfMemory;
         };
@@ -643,7 +647,7 @@ pub const Manager = struct {
         self.sessions.append(self.gpa, s) catch |err| {
             self.gpa.free(buf);
             self.gpa.destroy(s);
-            killChild(spawned.child);
+            process.killChild(spawned.child);
             _ = linux.close(spawned.master);
             return err;
         };
@@ -652,7 +656,7 @@ pub const Manager = struct {
             _ = self.sessions.pop();
             self.gpa.free(buf);
             self.gpa.destroy(s);
-            killChild(spawned.child);
+            process.killChild(spawned.child);
             _ = linux.close(spawned.master);
             return err;
         };
@@ -668,7 +672,7 @@ pub const Manager = struct {
         // 先按 session id 扫一遍 /proc，再 HUP shell（pump 用 poll + stopping，
         // 不依赖 slave 先关闭，避免 join 永久卡住）。
         s.stopping.store(true, .release);
-        killSessionProcesses(self.io, s.child);
+        process.killSessionProcesses(self.io, s.child);
         _ = linux.kill(-s.child, .HUP);
         _ = linux.kill(s.child, .HUP);
         if (s.pump_thread) |t| {
@@ -694,58 +698,6 @@ pub const Manager = struct {
         self.gpa.destroy(s);
     }
 };
-
-/// 结束 shell 所在的进程组；-pid 失败时再单独杀直接子进程，并回收僵尸。
-fn killChild(child: posix.pid_t) void {
-    _ = linux.kill(-child, .KILL);
-    _ = linux.kill(child, .KILL);
-    var status: i32 = 0;
-    _ = linux.waitpid(child, &status, 0);
-}
-
-/// 杀掉同一 session（sid == shell pid）里的所有进程，包括 job control 拆出去的
-/// 后台作业。只读 /proc/<pid>/stat 的第 6 个字段，Linux 专用。
-fn killSessionProcesses(io: Io, sid: posix.pid_t) void {
-    var proc = std.Io.Dir.openDirAbsolute(io, "/proc", .{ .iterate = true }) catch return;
-    defer proc.close(io);
-
-    var it = proc.iterate();
-    while (it.next(io) catch return) |entry| {
-        const pid = std.fmt.parseInt(posix.pid_t, entry.name, 10) catch continue;
-        if (pid <= 1 or pid == sid) continue;
-
-        var path_buf: [64]u8 = undefined;
-        const path_raw = std.fmt.bufPrint(&path_buf, "/proc/{s}/stat", .{entry.name}) catch continue;
-        path_buf[path_raw.len] = 0;
-        const path = path_buf[0..path_raw.len :0];
-        const fd = posix.openat(posix.AT.FDCWD, path, .{
-            .ACCMODE = .RDONLY,
-            .CLOEXEC = true,
-        }, 0) catch continue;
-        defer _ = linux.close(fd);
-
-        var buf: [512]u8 = undefined;
-        // 进程可能在 readdir 和 open/read 之间退出；直接用原始系统调用并把
-        // ESRCH 当成“已经没了”，避免 std.Io 把 /proc 的竞态当成 programmer bug。
-        const rc = linux.read(fd, &buf, buf.len);
-        const n: usize = switch (linux.errno(rc)) {
-            .SUCCESS => rc,
-            else => continue,
-        };
-        if (n == 0) continue;
-        const data = buf[0..n];
-
-        // "pid (comm) state ppid pgrp session ..."；comm 里可能有空格/括号。
-        const rparen = std.mem.lastIndexOfScalar(u8, data, ')') orelse continue;
-        var fields = std.mem.tokenizeScalar(u8, data[rparen + 1 ..], ' ');
-        _ = fields.next() orelse continue; // state
-        _ = fields.next() orelse continue; // ppid
-        _ = fields.next() orelse continue; // pgrp
-        const session_text = fields.next() orelse continue;
-        const session = std.fmt.parseInt(posix.pid_t, session_text, 10) catch continue;
-        if (session == sid) _ = linux.kill(pid, .KILL);
-    }
-}
 
 const Session = struct {
     manager: *Manager,
@@ -883,7 +835,7 @@ fn sendCwd(att: *Attachment, abs_raw: []const u8) !void {
 }
 
 /// 读取 shell 的 /proc/<pid>/cwd，变了才发；force 用于客户端主动请求。
-fn refreshCwd(s: *Session, force: bool) void {
+pub fn refreshCwd(s: *Session, force: bool) void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const n = readProcCwd(s.manager.io, s.child, &buf) orelse return;
     const abs = buf[0..n];
@@ -970,118 +922,6 @@ fn pump(s: *Session) void {
         }
     }
     s.mutex.unlock(io);
-}
-
-// ---------------------------------------------------------------------------
-// WebSocket 前端
-// ---------------------------------------------------------------------------
-
-const Control = struct {
-    t: []const u8 = "",
-    cols: ?u16 = null,
-    rows: ?u16 = null,
-};
-
-/// 解析一条控制消息。分配只发生在调用方提供的栈缓冲里，消息用完即弃。
-fn parseControl(scratch: []u8, data: []const u8) !Control {
-    var fba: std.heap.FixedBufferAllocator = .init(scratch);
-    return std.json.parseFromSliceLeaky(Control, fba.allocator(), data, .{ .ignore_unknown_fields = true });
-}
-
-/// 接管一条已升级的 WebSocket：attach 到会话、转发输入与 resize，断开时 detach。
-pub fn serve(
-    io: Io,
-    manager: *Manager,
-    ws: *http.Server.WebSocket,
-    stream: *const net.Stream,
-    auth_session: [16]u8,
-    session_id: ?[16]u8,
-    offset: u64,
-) !void {
-    var att: Attachment = .{
-        .io = io,
-        .gpa = manager.gpa,
-        .ws = ws,
-        .stream = stream,
-        .auth_session = auth_session,
-    };
-    // 先启动写线程：attach 的 hello/回放也走队列，attach 本身不必等 socket。
-    try att.startWriter();
-    defer att.stopWriter();
-
-    manager.attach(&att, session_id, offset) catch |err| {
-        const body = switch (err) {
-            error.TooManySessions => "{\"t\":\"error\",\"reason\":\"too_many_sessions\"}",
-            error.SessionBusy => "{\"t\":\"error\",\"reason\":\"session_busy\"}",
-            error.PtySpawnFailed => "{\"t\":\"error\",\"reason\":\"pty_failed\"}",
-            error.Unauthorized => "{\"t\":\"error\",\"reason\":\"unauthorized\"}",
-            else => "{\"t\":\"error\"}",
-        };
-        att.dropQueued();
-        // writerLoop 可能正拿着 send_mutex 写队列里的帧；错误帧必须排队，
-        // 否则两个线程会同时写同一个 WebSocket/Wirer。
-        att.send_mutex.lockUncancelable(io);
-        ws.writeMessage(body, .text) catch {};
-        att.send_mutex.unlock(io);
-        return err;
-    };
-    defer manager.detach(&att);
-
-    // 控制消息都很小，用固定栈缓冲解析，避免每条心跳都走 page_allocator。
-    var control_scratch: [1024]u8 = undefined;
-
-    while (true) {
-        const msg = ws.readSmallMessage() catch return;
-        // 注销/接管/认证过期后 socket 可能还有已经读出的消息；不能再让它
-        // 写入共享 PTY，否则旧前端仍能向新前端正在使用的 shell 注入输入。
-        if (!att.alive.load(.acquire)) return;
-        switch (msg.opcode) {
-            .ping => att.sendRaw(msg.data, .pong) catch return,
-            .binary => {
-                const s = att.session orelse return;
-                pty.writeAll(s.master, msg.data) catch return;
-            },
-            .text => {
-                const control = parseControl(&control_scratch, msg.data) catch continue;
-                if (std.mem.eql(u8, control.t, "close")) {
-                    manager.destroyAttached(&att);
-                    return;
-                }
-                if (std.mem.eql(u8, control.t, "ping")) {
-                    // 应用层心跳：空终端没有输出，靠它确认连接还活着。
-                    att.sendText("{\"t\":\"pong\"}") catch return;
-                    continue;
-                }
-                if (std.mem.eql(u8, control.t, "cwd")) {
-                    const s = att.session orelse return;
-                    refreshCwd(s, true);
-                    continue;
-                }
-                if (std.mem.eql(u8, control.t, "resize")) {
-                    const s = att.session orelse return;
-                    const cols = control.cols orelse continue;
-                    const rows = control.rows orelse continue;
-                    if (cols < 2 or rows < 1) continue;
-                    pty.resize(s.master, cols, rows);
-                }
-            },
-            else => return,
-        }
-    }
-}
-
-/// 从 query 里解析 128-bit 会话 id（32 位十六进制）。
-pub fn parseSessionId(value: ?[]const u8) ?[16]u8 {
-    const v = value orelse return null;
-    if (v.len != 32) return null;
-    var out: [16]u8 = undefined;
-    _ = std.fmt.hexToBytes(&out, v) catch return null;
-    return out;
-}
-
-pub fn parseOffset(value: ?[]const u8) u64 {
-    const v = value orelse return 0;
-    return std.fmt.parseInt(u64, v, 10) catch 0;
 }
 
 test "cwd relative to /" {
@@ -1196,24 +1036,6 @@ test "ring buffer grows on demand up to its cap" {
     try std.testing.expectEqual(@as(u64, 2), s.start_abs);
     for (0..s.len) |i| got[i] = s.buf[(s.start + i) % s.buf.len];
     try std.testing.expectEqualStrings("cdefghijklmnopqr", got[0..s.len]);
-}
-
-test "control message parsing" {
-    var scratch: [1024]u8 = undefined;
-    const parsed = try parseControl(&scratch,
-        \\{"t":"resize","cols":120,"rows":40}
-    );
-    try std.testing.expectEqualStrings("resize", parsed.t);
-    try std.testing.expectEqual(@as(?u16, 120), parsed.cols);
-    try std.testing.expectEqual(@as(?u16, 40), parsed.rows);
-}
-
-test "unknown control fields are ignored" {
-    var scratch: [1024]u8 = undefined;
-    const parsed = try parseControl(&scratch,
-        \\{"t":"ping","extra":true}
-    );
-    try std.testing.expectEqualStrings("ping", parsed.t);
 }
 
 test "session id parsing rejects junk" {
