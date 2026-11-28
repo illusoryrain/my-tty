@@ -1,0 +1,170 @@
+/* --------------------------------------------------------------- panes */
+
+#workspace {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  position: relative;
+  background: var(--line);
+}
+
+.tab-workspace {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  gap: 1px;
+  background: var(--line);
+  grid-auto-flow: row;
+}
+
+.tab-workspace[hidden] {
+  display: none;
+}
+
+.pane {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  background: var(--bg);
+  border: 1px solid transparent;
+}
+
+.pane.active {
+  border-color: #2b3342;
+}
+
+/* 悬浮标题栏：不占布局高度，悬停/聚焦/出错时浮出。 */
+.pane-bar {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  max-width: calc(100% - 12px);
+  height: 22px;
+  padding: 0 4px 0 7px;
+  background: rgb(20 24 33 / 0.92);
+  border: 1px solid #2a3244;
+  border-radius: 6px;
+  box-shadow: 0 4px 14px rgb(0 0 0 / 0.35);
+  font-size: 11px;
+  color: var(--dim);
+  user-select: none;
+  opacity: 0;
+  transform: translateY(-2px);
+  transition: opacity 120ms ease, transform 120ms ease;
+  pointer-events: none;
+}
+
+.pane-bar.dragging {
+  opacity: 1;
+  transform: none;
+  pointer-events: auto;
+  cursor: grabbing;
+}
+
+.pane:hover .pane-bar,
+.pane:focus-within .pane-bar,
+.pane-bar.attention {
+  opacity: 1;
+  transform: none;
+  pointer-events: auto;
+}
+
+@media (hover: none) {
+  .pane.active .pane-bar {
+    opacity: 1;
+    transform: none;
+    pointer-events: auto;
+  }
+}
+
+/* 抓手是唯一能拖动状态栏的地方，点击状态文字仍然是重连。 */
+.pane-grip {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 12px;
+  cursor: grab;
+  touch-action: none;
+  background-image: radial-gradient(circle, #5f6880 1px, transparent 1px);
+  background-size: 4px 4px;
+}
+
+.pane-grip:active {
+  cursor: grabbing;
+}
+
+.pane-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #4a5268;
+}
+
+.pane-dot.ok {
+  background: var(--ok);
+}
+
+.pane-dot.error {
+  background: var(--err);
+}
+
+.pane-dot.pending {
+  background: var(--accent);
+}
+
+.pane-status {
+  cursor: default;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pane-status.error {
+  color: var(--err);
+  cursor: pointer;
+}
+
+.pane-status.ok {
+  color: var(--ok);
+}
+
+.pane-close {
+  border: 0;
+  background: transparent;
+  color: var(--dim);
+  padding: 0 4px;
+  font-size: 11px;
+}
+
+.pane-close:hover {
+  color: var(--err);
+  background: transparent;
+}
+
+.pane-term {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 6px 8px;
+  overflow: hidden;
+}
+
+.pane-term .xterm {
+  height: 100%;
+}
+
+.pane-term .xterm-viewport {
+  /* xterm.css 默认把 viewport 底色写死为 #000；行数取整后底部会露出一条黑边。 */
+  background-color: transparent !important;
+  scrollbar-width: thin;
+  scrollbar-color: #333a48 transparent;
+}
+
+.pane-term .xterm {
+  background-color: var(--bg);
+}
+

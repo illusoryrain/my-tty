@@ -30,7 +30,7 @@ jobs:
         run: zig fmt --check build.zig src/*.zig web/embed.zig
       - name: script syntax
         run: |
-          node --check web/app.js
+          cat web/js/*.js | node --check
           for f in tests/browser/*.cjs scripts/*.mjs; do node --check "$f"; done
           for f in scripts/*.sh; do bash -n "$f"; done
       - name: build

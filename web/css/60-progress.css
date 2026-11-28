@@ -1,0 +1,40 @@
+/* ------------------------------------------------------ upload progress */
+
+#upload-progress {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-top: 1px solid var(--line);
+  color: var(--dim);
+  font-size: 11px;
+}
+
+#upload-progress[hidden] {
+  display: none;
+}
+
+#upload-progress .bar {
+  flex: 1 1 auto;
+  height: 4px;
+  background: #252b38;
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+#uprog-fill {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+  transition: width 120ms linear;
+}
+
+#uprog-text {
+  white-space: nowrap;
+}
+
+#upload-progress .icon {
+  padding: 1px 5px;
+}
+

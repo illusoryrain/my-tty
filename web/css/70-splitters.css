@@ -1,0 +1,37 @@
+/* ------------------------------------------------------------ splitters */
+
+.splitter {
+  position: absolute;
+  z-index: 4;
+  background: transparent;
+  /* 触摸拖动分栏时不要让浏览器把它当成滚动/缩放。 */
+  touch-action: none;
+}
+
+.splitter:hover,
+.splitter.dragging {
+  background: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+.splitter.v {
+  top: 0;
+  bottom: 0;
+  width: 8px;
+  cursor: col-resize;
+  transform: translateX(-50%);
+}
+
+.splitter.h {
+  left: 0;
+  right: 0;
+  height: 8px;
+  cursor: row-resize;
+  transform: translateY(-50%);
+}
+
+#file-list .entry.drop-target {
+  background-color: #222c3f;
+  outline: 1px dashed var(--accent);
+  outline-offset: -1px;
+}
+

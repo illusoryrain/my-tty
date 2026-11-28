@@ -1,0 +1,185 @@
+/* --------------------------------------------------------- touch / mobile */
+
+/* 顶栏按钮多，窄屏隐藏品牌并收紧间距，避免横向溢出。 */
+@media (max-width: 620px) {
+  #bar {
+    gap: 4px;
+    padding: 0 6px;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  #bar::-webkit-scrollbar {
+    display: none;
+  }
+
+  #bar .brand {
+    display: none;
+  }
+
+  #bar button {
+    padding: 4px 7px;
+    font-size: 11px;
+  }
+}
+
+/* 触摸设备没有 hover：文件操作必须常显，点击区域也要够大。 */
+@media (hover: none), (pointer: coarse) {
+  /* 悬浮标题栏在手机上会盖住终端首行；改成固定在 pane 顶部。 */
+  .pane-bar {
+    position: static;
+    order: -1;
+    max-width: none;
+    height: 26px;
+    padding: 0 6px;
+    background: var(--panel);
+    border: 0;
+    border-bottom: 1px solid var(--line);
+    border-radius: 0;
+    box-shadow: none;
+    opacity: 1;
+    transform: none;
+    pointer-events: auto;
+  }
+
+  .pane-status {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .pane-close {
+    min-width: 30px;
+    min-height: 24px;
+  }
+
+  /* 触摸端没有 hover 提示，给分栏加一个可见的抓取点并放大热区。 */
+  .splitter.v {
+    width: 16px;
+  }
+
+  .splitter.h {
+    height: 16px;
+  }
+
+  .splitter.v::after,
+  .splitter.h::after {
+    content: "";
+    position: absolute;
+    background: #4a5268;
+    border-radius: 2px;
+    pointer-events: none;
+  }
+
+  .splitter.v::after {
+    left: 50%;
+    top: 50%;
+    width: 3px;
+    height: 36px;
+    transform: translate(-50%, -50%);
+  }
+
+  .splitter.h::after {
+    left: 50%;
+    top: 50%;
+    width: 36px;
+    height: 3px;
+    transform: translate(-50%, -50%);
+  }
+
+  #prompt-input,
+  #login-password,
+  #find-input,
+  .editor-text,
+  .editor-gutter {
+    /* iOS 在字体小于 16px 时会自动放大页面。 */
+    font-size: 16px;
+  }
+
+  #tabbar {
+    height: 38px;
+    padding: 0 6px;
+  }
+
+  .tab-label,
+  .tab-close,
+  #tab-more,
+  #tab-add,
+  #tab-menu .menu-label,
+  #tab-menu .menu-close {
+    min-height: 32px;
+  }
+
+  #bar {
+    height: 44px;
+  }
+
+  #files {
+    top: 44px;
+  }
+
+  #bar button {
+    min-height: 34px;
+    padding: 5px 9px;
+  }
+
+  #bar button.icon {
+    min-width: 34px;
+  }
+
+  #files-resize {
+    flex-basis: 12px;
+  }
+
+  #file-list {
+    --tree-row-height: 30px;
+  }
+
+  #file-list .entry {
+    padding: 5px 4px;
+  }
+
+  #file-list .entry .name {
+    padding: 5px 4px;
+  }
+
+  #file-list .entry .caret {
+    width: 22px;
+    height: 26px;
+    font-size: 13px;
+  }
+
+  #file-list .entry .caret-spacer {
+    flex-basis: 22px;
+    width: 22px;
+  }
+
+  #file-list .entry .actions {
+    display: inline-flex;
+  }
+
+  #file-list .entry .actions .icon {
+    min-width: 30px;
+    min-height: 30px;
+    padding: 2px 6px;
+    font-size: 13px;
+  }
+
+  .files-head {
+    padding: 6px;
+  }
+
+  .files-head button {
+    min-width: 32px;
+    min-height: 32px;
+    padding: 4px 6px;
+  }
+
+  #keys {
+    padding-bottom: calc(5px + env(safe-area-inset-bottom, 0px));
+  }
+
+  #keys button {
+    min-height: 40px;
+    padding: 8px 10px;
+  }
+}

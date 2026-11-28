@@ -1,0 +1,295 @@
+/* ------------------------------------------------------------- file panel */
+
+#files {
+  flex: 0 0 var(--files-width, 300px);
+  min-width: 0;
+  max-width: none;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--panel);
+  border-right: 1px solid var(--line);
+  font-size: 13px;
+}
+
+#files[hidden] {
+  display: none;
+}
+
+#files-resize {
+  flex: 0 0 6px;
+  background: transparent;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+#files-resize:hover,
+#files-resize.dragging {
+  background: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+.files-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 8px;
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+}
+
+.files-head .spacer {
+  flex: 1 1 auto;
+}
+
+#crumb {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  overflow: hidden;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+#crumb button {
+  border: 0;
+  background: transparent;
+  padding: 2px 3px;
+  color: var(--fg);
+}
+
+#crumb button:hover {
+  background: #232a3b;
+}
+
+#crumb .sep {
+  color: #4a5268;
+}
+
+#crumb button.active {
+  color: var(--fg);
+}
+
+button.icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px 7px;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+/* 文件工具栏固定成方形，避免不同符号宽度导致图标看着偏心。 */
+.files-head button.icon {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  font-size: 14px;
+  line-height: 1;
+}
+
+#files-cwd-sync {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 55%, var(--line));
+  background: color-mix(in srgb, var(--ok) 18%, #1d2230);
+}
+
+#files-cwd-sync:hover {
+  background: color-mix(in srgb, var(--ok) 28%, #1d2230);
+}
+
+#files-cwd-sync.off,
+#files-cwd-sync.off:hover {
+  color: var(--dim);
+  border-color: var(--line);
+  background: #1d2230;
+  opacity: 0.55;
+}
+
+#file-list {
+  list-style: none;
+  margin: 0;
+  padding: 4px;
+  /* 每行等高，虚拟滚动用行高计算总高度和窗口位置。触摸端在媒体查询里改大。 */
+  --tree-row-height: 24px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+  /* 和终端 .xterm-viewport 保持同一种细滚动条。 */
+  scrollbar-width: thin;
+  scrollbar-color: #333a48 transparent;
+}
+
+#file-list ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+#file-list .tree-node,
+#file-list .tree-spacer {
+  list-style: none;
+}
+
+#file-list .entry .caret {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--dim);
+  font-size: 11px;
+  line-height: 1;
+}
+
+/* 行内图标用 CSS mask 画，而不是每行三个 <svg>：3000 项时每行少 8 个节点，
+   整棵树的 HTML 解析从约 160ms 降到约 60ms。 */
+#file-list .entry .caret::before,
+#file-list .entry .actions .icon::before {
+  content: "";
+  display: block;
+  background-color: currentColor;
+  -webkit-mask: var(--file-icon) center / contain no-repeat;
+  mask: var(--file-icon) center / contain no-repeat;
+}
+
+#file-list [data-act="download"] {
+  --file-icon: url("data:image/svg+xml,<svg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%20fill='none'%20stroke='%23000'%20stroke-width='1.4'%20stroke-linecap='round'%20stroke-linejoin='round'><path%20d='M8%202.5v8'/><path%20d='M4.5%207%208%2010.5%2011.5%207'/><path%20d='M3.5%2013h9'/></svg>");
+}
+
+#file-list [data-act="rename"] {
+  --file-icon: url("data:image/svg+xml,<svg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%20fill='none'%20stroke='%23000'%20stroke-width='1.4'%20stroke-linecap='round'%20stroke-linejoin='round'><path%20d='M3%2013l1-3%207-7%202%202-7%207z'/><path%20d='M9.5%203.5l2%202'/></svg>");
+}
+
+#file-list [data-act="delete"] {
+  --file-icon: url("data:image/svg+xml,<svg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%20fill='none'%20stroke='%23000'%20stroke-width='1.4'%20stroke-linecap='round'%20stroke-linejoin='round'><path%20d='M4%204l8%208'/><path%20d='M12%204l-8%208'/></svg>");
+}
+
+#file-list [data-act="toggle"] {
+  --file-icon: url("data:image/svg+xml,<svg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%20fill='none'%20stroke='%23000'%20stroke-width='1.4'%20stroke-linecap='round'%20stroke-linejoin='round'><path%20d='M6%204l4%204-4%204'/></svg>");
+}
+
+#file-list .entry .caret::before {
+  width: 10px;
+  height: 10px;
+  transition: transform 120ms;
+}
+
+#file-list .entry .caret.open::before {
+  transform: rotate(90deg);
+}
+
+#file-list .entry .caret:hover {
+  color: var(--fg);
+  background: transparent;
+}
+
+#file-list .entry .caret-spacer {
+  flex: 0 0 16px;
+  width: 16px;
+}
+
+#file-list .entry.selected {
+  background-color: #222b3c;
+}
+
+#file-list .entry.selected .name {
+  color: var(--fg);
+}
+
+#file-list .entry {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  box-sizing: border-box;
+  height: var(--tree-row-height);
+  min-width: 0;
+  /* 左右内边距由每行的缩进内联覆盖 padding-left。 */
+  padding: 2px 4px;
+  border-radius: 4px;
+  /* 拍平后的树用背景画每一层祖先的竖导引线（原来靠嵌套 ul 的左边框）。 */
+  background-image: repeating-linear-gradient(to right, #252b38 0 1px, transparent 1px 17px);
+  background-position: 13px 0;
+  background-size: max(0px, calc(var(--indent, 13px) - 13px)) 100%;
+  background-repeat: no-repeat;
+}
+
+#file-list .entry:hover {
+  background-color: #1c2231;
+}
+
+#file-list .entry .name {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+  border: 0;
+  background: transparent;
+  padding: 3px 4px;
+  color: var(--fg);
+}
+
+#file-list .entry.directory .name {
+  color: var(--accent);
+}
+
+#file-list .entry .size {
+  flex: 0 0 auto;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  color: #5f6880;
+  font-size: 11px;
+}
+
+#file-list .entry .actions {
+  flex: 0 0 auto;
+  display: none;
+  gap: 2px;
+}
+
+#file-list .entry:hover .actions {
+  display: inline-flex;
+}
+
+#file-list .entry .actions .icon {
+  padding: 1px 5px;
+  font-size: 11px;
+  color: var(--dim);
+}
+
+#file-list .entry .actions .icon::before {
+  width: 12px;
+  height: 12px;
+}
+
+#file-list .empty {
+  display: flex;
+  align-items: center;
+  box-sizing: border-box;
+  height: var(--tree-row-height);
+  padding: 0 8px;
+  color: var(--dim);
+}
+
+#notice {
+  margin: 0;
+  padding: 6px 10px;
+  min-height: 26px;
+  font-size: 11px;
+  color: var(--dim);
+  border-top: 1px solid var(--line);
+  word-break: break-word;
+}
+
+#notice.error {
+  color: var(--err);
+}
+
