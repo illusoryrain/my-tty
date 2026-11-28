@@ -146,6 +146,23 @@ code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST -b "$COOKIE_JAR" \
 [ -f "$ROOT/a.txt" ]
 pass "rename does not overwrite existing target"
 
+# FIFO/设备节点不能让服务端卡在 open()，也不能被原子替换成普通文件。
+mkfifo "$ROOT/fifo"
+for endpoint in write upload; do
+  code=$(timeout 5 curl -sS -o /dev/null -w '%{http_code}' -X PUT -b "$COOKIE_JAR" \
+    --data-binary 'new' "$API/$endpoint?path=$REL/fifo")
+  [ "$code" = "400" ]
+  [ -p "$ROOT/fifo" ]
+done
+mkdir "$ROOT/write-dir"
+for endpoint in write upload; do
+  code=$(timeout 5 curl -sS -o /dev/null -w '%{http_code}' -X PUT -b "$COOKIE_JAR" \
+    --data-binary 'new' "$API/$endpoint?path=$REL/write-dir")
+  [ "$code" = "400" ]
+  [ -d "$ROOT/write-dir" ]
+done
+pass "write/upload reject FIFO and directory targets"
+
 printf 'old' >"$ROOT/hard.txt"
 ln "$ROOT/hard.txt" "$ROOT/hard-link.txt"
 code=$(curl -sS -o /dev/null -w '%{http_code}' -X PUT -b "$COOKIE_JAR" --data-binary 'new' \
@@ -239,6 +256,27 @@ cmp -s "$CHUNK_SRC" "$ROOT/chunk.bin"
 [ "$(stat -c%a "$ROOT/chunk.bin")" = "600" ]
 pass "upload preserves permissions"
 curl -fsS -X DELETE -b "$COOKIE_JAR" "$API/delete?path=$REL/chunk.bin" >/dev/null
+
+# 上传中的临时文件必须是 0600，不能提前露出最终文件内容或宽权限。
+mkdir "$ROOT/stage"
+printf 'old' >"$ROOT/stage/target"
+chmod 644 "$ROOT/stage/target"
+dd if=/dev/zero of="$UPLOAD_SRC" bs=1024 count=128 2>/dev/null
+curl -fsS --limit-rate 64k --max-time 30 -X PUT -b "$COOKIE_JAR" \
+  --data-binary @"$UPLOAD_SRC" "$API/upload?path=$REL/stage/target" >/dev/null &
+CURL_PID=$!
+TEMP=""
+for _ in $(seq 1 100); do
+  TEMP=$(find "$ROOT/stage" -maxdepth 1 -type f ! -name target -print -quit)
+  [ -n "$TEMP" ] && break
+  sleep 0.02
+done
+[ -n "$TEMP" ]
+[ "$(stat -c%a "$TEMP")" = "600" ]
+wait "$CURL_PID"
+cmp -s "$UPLOAD_SRC" "$ROOT/stage/target"
+[ "$(stat -c%a "$ROOT/stage/target")" = "644" ]
+pass "in-progress upload temp is 0600 and restores target mode"
 
 echo "== archive =="
 curl -fsS -X POST -b "$COOKIE_JAR" "$API/mkdir?path=$REL/tardir" >/dev/null

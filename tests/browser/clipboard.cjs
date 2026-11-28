@@ -19,7 +19,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   page.on("pageerror", (e) => errors.push(String(e)));
   page.on("console", (m) => { if (m.type() === "error" && !m.text().includes("401")) errors.push(m.text()); });
 
-  await page.goto(BASE + "/");
+  await page.goto(BASE + "/?debug=1");
   await page.fill("#login-password", PASSWORD);
   await page.click("#login-submit");
   await page.waitForSelector(".pane .xterm");
@@ -101,6 +101,20 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   await page.waitForTimeout(400);
   assert((await termText()).includes("PASTE_INSERT_TOKEN"), "Shift+Insert pastes");
   await page.keyboard.press("Control+U");
+
+  // 浏览器没有 Clipboard API 时走 textarea 兜底；复制后必须把焦点还给终端。
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, "clipboard", { value: undefined, configurable: true });
+  });
+  await page.locator(".pane .xterm-helper-textarea").focus();
+  await page.evaluate(() => window.__myttyDebug.panes[0].term.selectAll());
+  assert((await page.evaluate(() => window.__myttyDebug.panes[0].term.getSelection().length)) > 0, "legacy copy has selection");
+  await page.keyboard.press("Control+C");
+  await page.waitForTimeout(300);
+  const focusBack = await page.evaluate(() =>
+    document.activeElement === document.querySelector(".pane .xterm-helper-textarea")
+  );
+  assert(focusBack, "legacy copy restores terminal focus");
 
   assert(errors.length === 0, "console errors: " + errors.join(" | "));
   console.log("clipboard: PASS");

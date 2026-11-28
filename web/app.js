@@ -2800,6 +2800,7 @@
   }
 
   function legacyCopy(text) {
+    const previous = document.activeElement;
     const ta = document.createElement("textarea");
     ta.value = text;
     ta.setAttribute("readonly", "");
@@ -2811,6 +2812,7 @@
       document.execCommand("copy");
     } catch (_) {}
     ta.remove();
+    if (previous instanceof HTMLElement && previous.isConnected) previous.focus();
   }
 
   // ---------------------------------------------------------- 移动按键条

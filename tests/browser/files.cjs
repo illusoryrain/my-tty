@@ -1,4 +1,4 @@
-// 9 MiB 分片上传、下载往返、目录 tar、临时文件清理。
+// 9 MiB 单次上传、下载往返、目录 tar、临时文件清理。
 const { chromium } = require("playwright");
 const fs = require("fs");
 const os = require("os");

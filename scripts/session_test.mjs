@@ -92,5 +92,33 @@ if (c.session === sid) throw new Error("close did not destroy the session");
 c.ws.send(JSON.stringify({ t: "close" }));
 c.ws.close();
 
+// 注销必须让已经建立的终端立即断开；注销前签发、还没用的票据也不能再开新终端。
+const t1 = await ticket();
+const t2 = await ticket();
+const live = new WebSocket(`${base.replace(/^http/, "ws")}/ws?ticket=${encodeURIComponent(t1)}`);
+let liveClosed = false;
+live.addEventListener("close", () => { liveClosed = true; });
+await new Promise((res, rej) => {
+  live.addEventListener("open", res, { once: true });
+  live.addEventListener("error", () => rej(new Error("logout websocket failed to open")), { once: true });
+});
+await sleep(200);
+const logout = await fetch(`${base}/api/auth/logout`, { method: "POST", headers: { cookie } });
+if (logout.status !== 200) throw new Error("logout failed: " + logout.status);
+for (let i = 0; i < 100 && !liveClosed; i++) await sleep(20);
+if (!liveClosed) throw new Error("existing websocket stayed open after logout");
+
+const stale = new WebSocket(`${base.replace(/^http/, "ws")}/ws?ticket=${encodeURIComponent(t2)}`);
+const staleOpened = await new Promise((res) => {
+  const timer = setTimeout(() => res(true), 1500);
+  stale.addEventListener("open", () => { clearTimeout(timer); res(true); }, { once: true });
+  stale.addEventListener("error", () => { clearTimeout(timer); res(false); }, { once: true });
+  stale.addEventListener("close", () => { clearTimeout(timer); res(false); }, { once: true });
+});
+try { stale.close(); } catch {}
+if (staleOpened) throw new Error("ticket issued before logout still opened a terminal");
+const status = await fetch(`${base}/api/auth/status`, { headers: { cookie } });
+if (status.status !== 401) throw new Error("session still active after logout: " + status.status);
+
 console.log("session smoke: PASS");
 process.exit(0);

@@ -36,6 +36,8 @@ pub const Auth = struct {
 
     const Ticket = struct {
         id: [16]u8 = @splat(0),
+        /// 票据签发时绑定的登录会话；会话注销/过期后票据立即失效。
+        session: [16]u8 = @splat(0),
         expires_ns: i96 = 0,
         used: bool = false,
     };
@@ -123,10 +125,12 @@ pub const Auth = struct {
 
     /// 校验 Cookie 值是否对应一个未过期会话。
     pub fn validate(self: *Auth, cookie_value: []const u8) bool {
-        if (cookie_value.len != 32) return false;
-        var raw: [16]u8 = undefined;
-        _ = std.fmt.hexToBytes(&raw, cookie_value) catch return false;
+        const raw = rawSessionFromCookie(cookie_value) orelse return false;
+        return self.validateRaw(&raw);
+    }
 
+    /// 校验 16 字节原始会话 id，并刷新活跃时间。WebSocket 升级时也走这里。
+    pub fn validateRaw(self: *Auth, raw: *const [16]u8) bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
@@ -134,10 +138,27 @@ pub const Auth = struct {
         const idle_limit = self.idleNs();
 
         // 先看上次命中的槽位：一个浏览器一直开着时，几乎总是这里直接命中。
-        if (self.checkSession(self.last_slot, &raw, now, idle_limit)) return true;
+        if (self.checkSession(self.last_slot, raw, now, idle_limit)) return true;
         for (0..self.sessions.len) |i| {
             if (i == self.last_slot) continue;
-            if (self.checkSession(i, &raw, now, idle_limit)) return true;
+            if (self.checkSession(i, raw, now, idle_limit)) return true;
+        }
+        return false;
+    }
+
+    /// 只检查会话是否仍然有效，不刷新 last_seen。用于已经建立的 WebSocket：
+    /// 终端流量不应该替 HTTP 会话续命，但会话注销/过期后必须能把它踢掉。
+    pub fn sessionValid(self: *Auth, raw: *const [16]u8) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.sessionValidLocked(raw, self.nowNs(), self.idleNs());
+    }
+
+    fn sessionValidLocked(self: *Auth, raw: *const [16]u8, now: i96, idle_limit: i96) bool {
+        for (&self.sessions) |*s| {
+            if (!s.used or s.expires_ns <= now) continue;
+            if (self.idle_hours != 0 and now - s.last_seen_ns > idle_limit) continue;
+            if (config.constantTimeEql(&s.id, raw)) return true;
         }
         return false;
     }
@@ -162,11 +183,12 @@ pub const Auth = struct {
 
     /// 为 WebSocket 升级签发一次性短票据：浏览器无法给 WS 请求加自定义头，
     /// 又不想把长期会话放进 URL。票据 30 秒有效、用一次即废。
-    pub fn issueTicket(self: *Auth) [32]u8 {
+    pub fn issueTicket(self: *Auth, session: [16]u8) ?[32]u8 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
         const now = self.nowNs();
+        if (!self.sessionValidLocked(&session, now, self.idleNs())) return null;
         var slot: usize = 0;
         var oldest: i96 = std.math.maxInt(i96);
         for (&self.tickets, 0..) |*t, i| {
@@ -182,19 +204,25 @@ pub const Auth = struct {
 
         var raw: [16]u8 = undefined;
         self.io.random(&raw);
-        self.tickets[slot] = .{ .id = raw, .expires_ns = now + ticket_ttl_ns, .used = true };
+        self.tickets[slot] = .{
+            .id = raw,
+            .session = session,
+            .expires_ns = now + ticket_ttl_ns,
+            .used = true,
+        };
         return std.fmt.bytesToHex(raw, .lower);
     }
 
-    pub fn consumeTicket(self: *Auth, value: []const u8) bool {
-        if (value.len != 32) return false;
+    pub fn consumeTicket(self: *Auth, value: []const u8) ?[16]u8 {
+        if (value.len != 32) return null;
         var raw: [16]u8 = undefined;
-        _ = std.fmt.hexToBytes(&raw, value) catch return false;
+        _ = std.fmt.hexToBytes(&raw, value) catch return null;
 
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
         const now = self.nowNs();
+        const idle_limit = self.idleNs();
         for (&self.tickets) |*t| {
             if (!t.used) continue;
             if (t.expires_ns <= now) {
@@ -203,10 +231,11 @@ pub const Auth = struct {
             }
             if (config.constantTimeEql(&t.id, &raw)) {
                 t.used = false;
-                return true;
+                if (self.sessionValidLocked(&t.session, now, idle_limit)) return t.session;
+                return null;
             }
         }
-        return false;
+        return null;
     }
 
     /// 定期清理过期/空闲会话与一次性票据。
@@ -229,10 +258,9 @@ pub const Auth = struct {
         }
     }
 
-    pub fn logout(self: *Auth, cookie_value: []const u8) void {
-        if (cookie_value.len != 32) return;
-        var raw: [16]u8 = undefined;
-        _ = std.fmt.hexToBytes(&raw, cookie_value) catch return;
+    /// 注销会话；返回被注销的原始 id，调用方据此关闭它打开的 WebSocket。
+    pub fn logout(self: *Auth, cookie_value: []const u8) ?[16]u8 {
+        const raw = rawSessionFromCookie(cookie_value) orelse return null;
 
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -241,11 +269,20 @@ pub const Auth = struct {
             if (s.used and config.constantTimeEql(&s.id, &raw)) {
                 s.used = false;
                 s.expires_ns = 0;
-                return;
+                return raw;
             }
         }
+        return null;
     }
 };
+
+/// 把 32 位十六进制 Cookie 值解析成 16 字节原始会话 id。
+pub fn rawSessionFromCookie(cookie_value: []const u8) ?[16]u8 {
+    if (cookie_value.len != 32) return null;
+    var raw: [16]u8 = undefined;
+    _ = std.fmt.hexToBytes(&raw, cookie_value) catch return null;
+    return raw;
+}
 
 /// 从 `Cookie:` 头的值里取出会话 id。
 pub fn sessionFromCookieHeader(header: []const u8) ?[]const u8 {
@@ -323,11 +360,14 @@ test "login validate logout" {
     try std.testing.expect(auth.login("wrong") == null);
 
     const session = auth.login("correct horse").?;
+    const raw = rawSessionFromCookie(&session.cookie).?;
     try std.testing.expect(auth.validate(&session.cookie));
+    try std.testing.expect(auth.sessionValid(&raw));
     try std.testing.expect(!auth.validate("00000000000000000000000000000000"));
 
-    auth.logout(&session.cookie);
+    _ = auth.logout(&session.cookie);
     try std.testing.expect(!auth.validate(&session.cookie));
+    try std.testing.expect(!auth.sessionValid(&raw));
 }
 
 test "full session table evicts the least recently used session" {
@@ -364,13 +404,20 @@ test "zero ttl expires immediately" {
     try std.testing.expect(!auth.validate(&session.cookie));
 }
 
-test "ticket is one time" {
+test "ticket is one time and bound to a live session" {
     const io = std.testing.io;
     var auth = Auth.init(io, "pw", 7, 24);
-    const ticket = auth.issueTicket();
-    try std.testing.expect(auth.consumeTicket(&ticket));
-    try std.testing.expect(!auth.consumeTicket(&ticket));
-    try std.testing.expect(!auth.consumeTicket("nope"));
+    const login = auth.login("pw").?;
+    const session = rawSessionFromCookie(&login.cookie).?;
+    const ticket = auth.issueTicket(session).?;
+    try std.testing.expectEqualSlices(u8, &session, &auth.consumeTicket(&ticket).?);
+    try std.testing.expect(auth.consumeTicket(&ticket) == null);
+    try std.testing.expect(auth.consumeTicket("nope") == null);
+
+    const next = auth.issueTicket(session).?;
+    _ = auth.logout(&login.cookie);
+    try std.testing.expect(auth.consumeTicket(&next) == null);
+    try std.testing.expect(auth.issueTicket(session) == null);
 }
 
 test "set cookie format" {

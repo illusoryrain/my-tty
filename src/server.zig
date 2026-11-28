@@ -327,6 +327,8 @@ fn maintenance(io: Io, auth_state: *auth.Auth, manager: *session.Manager) void {
         // 会话回收每秒一次：pty_idle_minutes=0 也要在 ~1s 内生效；
         // 登录会话/票据的清理保持每分钟一次即可。
         manager.sweep();
+        // 已建立的 WebSocket 绑定登录会话；注销/过期后下一次 tick 内踢掉。
+        manager.enforceAuth(auth_state);
         if (ticks % 60 == 0) auth_state.sweep();
     }
 }
@@ -367,7 +369,7 @@ fn connectionMain(
                     respondClose(&request, "origin not allowed\n", .forbidden) catch {};
                     return;
                 }
-                if (!wsAuthorized(auth_state, &request)) {
+                const auth_session = wsAuthorized(auth_state, &request) orelse {
                     if (shouldLogAuthFailure(io, peer)) {
                         var pb: [64]u8 = undefined;
                         std.debug.print("未认证 ws peer={s} cookie={s}\n", .{
@@ -377,7 +379,7 @@ fn connectionMain(
                     }
                     respondClose(&request, "unauthorized\n", .unauthorized) catch {};
                     return;
-                }
+                };
                 // 终端可能空闲很久；上面已经 disarm，不再参与 HTTP 空闲清理。
                 const sid = session.parseSessionId(util.queryParam(request.head.target, "session"));
                 const resume_offset = session.parseOffset(util.queryParam(request.head.target, "offset"));
@@ -385,7 +387,7 @@ fn connectionMain(
                 var peer_buf: [64]u8 = undefined;
                 const peer_name = peerText(&peer_buf, peer);
                 std.debug.print("ws 连接 peer={s}\n", .{peer_name});
-                if (session.serve(io, manager, &ws, &stream, sid, resume_offset)) |_| {
+                if (session.serve(io, manager, &ws, &stream, auth_session, sid, resume_offset)) |_| {
                     std.debug.print("ws 断开 peer={s}\n", .{peer_name});
                 } else |err| {
                     std.debug.print("ws 断开 peer={s}: {t}\n", .{ peer_name, err });
@@ -397,7 +399,7 @@ fn connectionMain(
                 return;
             },
             .none => {
-                handleHttp(io, gpa, cfg, auth_state, peer, stream.socket.handle, &request) catch return;
+                handleHttp(io, gpa, cfg, auth_state, manager, peer, stream.socket.handle, &request) catch return;
                 // 客户端要求关闭，或请求 body 没有干净读完时，绝不能在同一个连接上
                 // 继续解析下一段字节：残余 body 会被当成新请求（请求走私/响应错位）。
                 if (!request.head.keep_alive) return;
@@ -415,6 +417,7 @@ fn handleHttp(
     gpa: Allocator,
     cfg: *const config.Config,
     auth_state: *auth.Auth,
+    manager: *session.Manager,
     peer: net.IpAddress,
     fd: posix.fd_t,
     request: *http.Server.Request,
@@ -471,7 +474,7 @@ fn handleHttp(
         if (std.mem.eql(u8, path, "/api/auth/logout")) {
             var pb: [64]u8 = undefined;
             std.debug.print("注销 peer={s}\n", .{peerText(&pb, peer)});
-            return handleLogout(auth_state, trust_forwarded, request);
+            return handleLogout(auth_state, manager, trust_forwarded, request);
         }
         if (std.mem.eql(u8, path, "/api/auth/status")) return handleStatus(request);
         if (std.mem.eql(u8, path, "/api/auth/ticket")) return handleTicket(auth_state, request);
@@ -623,10 +626,19 @@ fn handleLogin(
     return request.respond(json, .{ .extra_headers = list });
 }
 
-fn handleLogout(auth_state: *auth.Auth, trust_forwarded: bool, request: *http.Server.Request) !void {
+fn handleLogout(
+    auth_state: *auth.Auth,
+    manager: *session.Manager,
+    trust_forwarded: bool,
+    request: *http.Server.Request,
+) !void {
     if (request.head.method != .POST) return respond(request, "method not allowed\n", .method_not_allowed);
 
-    if (auth.cookieFromRequest(request)) |cookie| auth_state.logout(cookie);
+    // 先注销 HTTP 会话，再关闭这个会话已经升级的 WebSocket。
+    // 否则另一个标签页/脚本里的终端在登出后仍然能继续执行命令。
+    if (auth.cookieFromRequest(request)) |cookie| {
+        if (auth_state.logout(cookie)) |session_id| manager.closeAuthSession(session_id);
+    }
 
     var cookie_buf: [256]u8 = undefined;
     const cookie = auth.setCookieValue(&cookie_buf, null, 0, auth.isSecureRequest(request, trust_forwarded));
@@ -642,7 +654,12 @@ fn handleLogout(auth_state: *auth.Auth, trust_forwarded: bool, request: *http.Se
 
 fn handleTicket(auth_state: *auth.Auth, request: *http.Server.Request) !void {
     if (request.head.method != .POST) return respond(request, "method not allowed\n", .method_not_allowed);
-    const ticket = auth_state.issueTicket();
+    const cookie = auth.cookieFromRequest(request) orelse
+        return respond(request, "{\"error\":\"unauthorized\"}\n", .unauthorized);
+    const session_id = auth.rawSessionFromCookie(cookie) orelse
+        return respond(request, "{\"error\":\"unauthorized\"}\n", .unauthorized);
+    const ticket = auth_state.issueTicket(session_id) orelse
+        return respond(request, "{\"error\":\"unauthorized\"}\n", .unauthorized);
 
     var buf: [64]u8 = undefined;
     const json = std.fmt.bufPrint(&buf, "{{\"ticket\":\"{s}\"}}", .{ticket}) catch
@@ -667,11 +684,15 @@ fn authorized(auth_state: *auth.Auth, request: *const http.Server.Request) bool 
 /// WebSocket：会话 Cookie 或一次性票据都行（浏览器/自动化客户端各取所需）。
 /// 票据优先消费：浏览器通常同时带 Cookie 和票据，若先认 Cookie，URL 里的票据
 /// 会一直留到 30 秒过期，代理日志泄漏时仍可被复用。
-fn wsAuthorized(auth_state: *auth.Auth, request: *const http.Server.Request) bool {
+/// 返回绑定的登录会话 id；已建立的连接由 manager 定期复查这个 id。
+fn wsAuthorized(auth_state: *auth.Auth, request: *const http.Server.Request) ?[16]u8 {
     if (util.queryParam(request.head.target, "ticket")) |ticket| {
-        if (auth_state.consumeTicket(ticket)) return true;
+        if (auth_state.consumeTicket(ticket)) |session_id| return session_id;
     }
-    return authorized(auth_state, request);
+    const cookie = auth.cookieFromRequest(request) orelse return null;
+    const session_id = auth.rawSessionFromCookie(cookie) orelse return null;
+    if (!auth_state.validateRaw(&session_id)) return null;
+    return session_id;
 }
 
 /// 日志里的客户端 IP（不带临时端口）。

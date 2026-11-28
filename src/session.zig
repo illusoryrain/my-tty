@@ -29,6 +29,7 @@ const Io = std.Io;
 
 const pty = @import("pty.zig");
 const config = @import("config.zig");
+const auth = @import("auth.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -43,6 +44,8 @@ pub const Attachment = struct {
     ws: *http.Server.WebSocket,
     stream: *const net.Stream,
     session: ?*Session = null,
+    /// 建立这条 WebSocket 时绑定的登录会话；登录会话注销/过期后由 Manager 关闭。
+    auth_session: [16]u8 = @splat(0),
     /// 直接写 socket 时用（attach 失败的错误帧）；正常输出走队列。
     send_mutex: Io.Mutex = .init,
     /// pump/attach 与连接线程会并发读写，必须是原子量。
@@ -218,6 +221,51 @@ pub const Manager = struct {
             }
             _ = self.retiring.swapRemove(i);
             r.att.stream.shutdown(self.io, .both) catch {};
+        }
+    }
+
+    fn shutAttachment(self: *Manager, att: *Attachment) void {
+        att.alive.store(false, .release);
+        att.stream.shutdown(self.io, .both) catch {};
+    }
+
+    /// 注销某个登录会话时立即关闭它建立的所有终端 WebSocket。
+    pub fn closeAuthSession(self: *Manager, session_id: [16]u8) void {
+        self.mutex.lockUncancelable(self.io);
+        for (self.sessions.items) |s| {
+            s.mutex.lockUncancelable(self.io);
+            if (s.attachment) |att| {
+                if (std.mem.eql(u8, &att.auth_session, &session_id)) self.shutAttachment(att);
+            }
+            s.mutex.unlock(self.io);
+        }
+        self.mutex.unlock(self.io);
+
+        self.retire_mutex.lockUncancelable(self.io);
+        defer self.retire_mutex.unlock(self.io);
+        for (self.retiring.items) |r| {
+            if (std.mem.eql(u8, &r.att.auth_session, &session_id)) self.shutAttachment(r.att);
+        }
+    }
+
+    /// 定期复查已升级 WebSocket 绑定的登录会话。HTTP 会话过期/被其他窗口
+    /// 注销后，终端也必须跟着断开；不能只在升级那一刻验一次 Cookie。
+    pub fn enforceAuth(self: *Manager, auth_state: *auth.Auth) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        for (self.sessions.items) |s| {
+            if (!s.mutex.tryLock()) continue;
+            if (s.attachment) |att| {
+                if (!auth_state.sessionValid(&att.auth_session)) self.shutAttachment(att);
+            }
+            s.mutex.unlock(self.io);
+        }
+
+        self.retire_mutex.lockUncancelable(self.io);
+        defer self.retire_mutex.unlock(self.io);
+        for (self.retiring.items) |r| {
+            if (!auth_state.sessionValid(&r.att.auth_session)) self.shutAttachment(r.att);
         }
     }
 
@@ -896,10 +944,17 @@ pub fn serve(
     manager: *Manager,
     ws: *http.Server.WebSocket,
     stream: *const net.Stream,
+    auth_session: [16]u8,
     session_id: ?[16]u8,
     offset: u64,
 ) !void {
-    var att: Attachment = .{ .io = io, .gpa = manager.gpa, .ws = ws, .stream = stream };
+    var att: Attachment = .{
+        .io = io,
+        .gpa = manager.gpa,
+        .ws = ws,
+        .stream = stream,
+        .auth_session = auth_session,
+    };
     // 先启动写线程：attach 的 hello/回放也走队列，attach 本身不必等 socket。
     try att.startWriter();
     defer att.stopWriter();

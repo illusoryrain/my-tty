@@ -17,7 +17,7 @@ Status:
 | Multiple tabs, each with independent 1–4 panes and draggable splitters | ✅ |
 | Font size adjustment | ✅ |
 | Terminal search / links / mobile key bar | ✅ |
-| File manager, text editor, chunked/resumable upload / download / directory tar | ✅ |
+| File manager, text editor, single-PUT upload / download / directory tar | ✅ |
 | Config file / environment / command-line precedence | ✅ |
 
 ## Build and run
@@ -213,11 +213,12 @@ Supports creating files/directories, rename, recursive delete, upload/download,
 and plain-text editing (≤1 MiB, `Ctrl+S` to save). New file/directory/rename use
 an in-page dialog rather than the native `prompt`.
 Upload by clicking ⇪, dragging into the panel, or dropping onto a directory row;
-files are sent in 4 MiB chunks with progress and cancel, and an interrupted
-upload resumes by asking the server for the committed offset. Single-file limit
-64 MiB.
-In-progress upload temp files are `0600`; after the final rename the file becomes
-`0644`.
+files are sent with a single PUT, with progress and cancel. The single-file limit
+is 64 MiB. An interrupted upload must be retried; there is no resume support.
+In-progress upload temp files are `0600`. When overwriting an existing file, its
+original mode/owner/xattrs are restored after the write. New files follow the
+process umask: the provided systemd unit uses `0077`, so they are `0600` by
+default; with `0022` they are usually `0644`.
 Downloads stream with `Content-Disposition: attachment`; directories download as
 `.tar`.
 A single listing returns at most 10,000 entries (the UI notes truncation);
@@ -393,7 +394,7 @@ created, keeping TUI borders and blocks continuous.
 
 ```sh
 zig test src/tests.zig        # config, auth/sessions, PTY env, protocol, file paths
-./scripts/smoke.sh            # real process: auth, files/chunks/archive, WS+PTY, graceful shutdown
+./scripts/smoke.sh            # real process: auth, files/upload/archive, WS+PTY, graceful shutdown
 ./scripts/browser_test.sh     # browser regression (npm --prefix tests/browser ci + chromium first)
 ./scripts/build-release.sh    # ReleaseSafe + strip, ~1.4 MiB
 ```
