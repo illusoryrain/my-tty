@@ -85,6 +85,9 @@
   const treeExpanded = new Set([""]);
   const treeChildren = new Map();
   const treeLoading = new Set();
+  /// 正在加载的目录 -> 该次加载的 Promise；同一目录被同时点开时只发一个请求，
+  /// 并且调用方（例如 applyDir）能等它真正结束再判断成功与否。
+  const treeLoads = new Map();
   let treeRootError = false;
   let cwdSyncEnabled = store.get("myttty.cwdSync") !== "0";
   // 终端内悬浮状态栏的位置（0..1，按可移动空间归一化），所有分屏共用。
@@ -1542,15 +1545,21 @@
     for (const item of failed) {
       if (item.dir === "") {
         treeRootError = true;
+      } else if (item.err.code === "not_found") {
+        removeMissingDir(item.dir);
       } else {
         treeExpanded.delete(item.dir);
         treeChildren.delete(item.dir);
       }
-      notice(`列目录失败: ${item.err.message}`, true);
-      if (item.dir === currentDir) currentDir = "";
+      notice(
+        item.err.code === "not_found"
+          ? `目录已不存在: ${item.dir || "/"}`
+          : `列目录失败: ${item.err.message}`,
+        true
+      );
     }
     if (!failed.some((item) => item.dir === "")) treeRootError = false;
-    if (currentDir && !treeChildren.has(currentDir)) currentDir = "";
+    currentDir = loadedAncestor(currentDir);
 
     renderCrumbs();
     renderTree();
@@ -1609,21 +1618,63 @@
     return list;
   }
 
+  /// 从 path 开始往上找第一个已经有缓存的目录；root 没加载时返回 ""。
+  function loadedAncestor(path) {
+    let p = path;
+    while (p && !treeChildren.has(p)) p = parentOf(p);
+    return p;
+  }
+
+  /// 目录在列出后消失（/proc 的 PID、被其他进程删掉的目录）：把父目录里的
+  /// 旧行和它自己的缓存一起清掉，并把当前位置退回最近的已加载祖先，
+  /// 不要停在一条永远打不开的路径上。
+  function removeMissingDir(path) {
+    if (!path) return;
+    const parent = parentOf(path);
+    const data = treeChildren.get(parent);
+    if (data) {
+      const name = baseName(path);
+      const entries = data.entries.filter((entry) => entry.name !== name);
+      if (entries.length !== data.entries.length) {
+        treeChildren.set(parent, { entries, truncated: data.truncated });
+        treeDirty = true;
+      }
+    }
+    dropTreePath(path);
+    currentDir = loadedAncestor(currentDir);
+    renderCrumbs();
+  }
+
   async function ensureTreeLoaded(path, force = false) {
-    if (treeLoading.has(path)) return;
-    if (!force && treeChildren.has(path)) return;
+    const pending = treeLoads.get(path);
+    if (pending) return await pending;
+    if (!force && treeChildren.has(path)) return true;
 
     treeLoading.add(path);
     if (!treeChildren.has(path)) scheduleRender();
+    const task = (async () => {
+      try {
+        const data = await loadDir(path);
+        if (data.truncated) notice(`目录 ${path || "/"} 条目过多，仅显示前 1 万项`);
+        return true;
+      } catch (err) {
+        if (err.code === "not_found") {
+          removeMissingDir(path);
+          notice(`目录已不存在: ${path || "/"}`, true);
+        } else {
+          if (!treeChildren.has(path)) treeExpanded.delete(path);
+          treeDirty = true;
+          notice(`列目录失败: ${err.message}`, true);
+        }
+        return false;
+      }
+    })();
+    treeLoads.set(path, task);
     try {
-      const data = await loadDir(path);
-      if (data.truncated) notice(`目录 ${path || "/"} 条目过多，仅显示前 1 万项`);
-    } catch (err) {
-      if (!treeChildren.has(path)) treeExpanded.delete(path);
-      treeDirty = true;
-      notice(`列目录失败: ${err.message}`, true);
+      return await task;
     } finally {
       treeLoading.delete(path);
+      treeLoads.delete(path);
       scheduleRenderWhenIdle();
     }
   }
@@ -1638,7 +1689,17 @@
     scrollTreeToSelected(alignTop);
     const pending = pathPrefixes(path).map((prefix) => ensureTreeLoaded(prefix, force));
     Promise.all(pending).then(() => {
-      if (currentDir === path && !filesEl.hidden) scrollTreeToSelected(alignTop);
+      if (currentDir !== path || filesEl.hidden) return;
+      if (!treeChildren.has(path)) {
+        // 目标目录没加载成功；ensureTreeLoaded 已经提示过了，这里只负责
+        // 把当前位置退回到最近一个能显示的祖先。
+        currentDir = loadedAncestor(parentOf(path));
+        renderCrumbs();
+        renderTree();
+        scrollTreeToSelected(alignTop);
+        return;
+      }
+      scrollTreeToSelected(alignTop);
     });
   }
 

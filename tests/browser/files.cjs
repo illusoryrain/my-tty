@@ -26,8 +26,14 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const browser = await chromium.launch({ executablePath: CHROME, args: ["--no-sandbox"] });
   const page = await browser.newPage({ viewport: { width: 1200, height: 800 } });
   const errors = [];
+  let allowMissing404 = false;
   page.on("pageerror", (e) => errors.push(String(e)));
-  page.on("console", (m) => { if (m.type() === "error" && !m.text().includes("401")) errors.push(m.text()); });
+  page.on("console", (m) => {
+    if (m.type() !== "error" || m.text().includes("401")) return;
+    // 下面会故意打开一个刚被删掉的目录，浏览器会把预期的 404 记成 console error。
+    if (allowMissing404 && m.text().includes("404")) return;
+    errors.push(m.text());
+  });
 
   await page.goto(BASE + "/");
   await page.fill("#login-password", PASSWORD);
@@ -180,6 +186,37 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     return !!el && el.textContent === "inner";
   });
   await page.locator(rowFor(`${ROOT_REL}/nested/inner`)).waitFor({ state: "visible", timeout: 8000 });
+
+  // 目录在列出后消失（例如 /proc 里的 PID 退出）：点击后不能停在打不开的
+  // 路径上，也不能把旧行一直留着。
+  fs.mkdirSync(path.join(ROOT, "vanishing"), { recursive: true });
+  const vanishedRel = `${ROOT_REL}/vanishing`;
+  await page.click("#files-refresh");
+  await page.waitForFunction(
+    (rel) => !!document.querySelector(`#file-list .entry[data-path="${rel}"]`),
+    vanishedRel
+  );
+  await page.waitForTimeout(300);
+  fs.rmSync(path.join(ROOT, "vanishing"), { recursive: true, force: true });
+  allowMissing404 = true;
+  await page.locator(`${rowFor(vanishedRel)} .name`).click();
+  await page.waitForFunction(
+    (name) => {
+      const el = document.querySelector("#crumb button.active");
+      return !!el && el.textContent === name;
+    },
+    ROOT_NAME,
+    { timeout: 8000 }
+  );
+  await page.waitForFunction(
+    (rel) => !document.querySelector(`#file-list .entry[data-path="${rel}"]`),
+    vanishedRel,
+    { timeout: 8000 }
+  );
+  const vanishedNotice = (await page.textContent("#notice")) || "";
+  assert(vanishedNotice.includes("目录已不存在"), "vanished dir notice: " + vanishedNotice);
+  await page.waitForTimeout(300);
+  allowMissing404 = false;
 
   const leftovers = fs.readdirSync(ROOT).filter((n) => n.startsWith(".myty-upload-"));
   assert(leftovers.length === 0, "no temp files");
