@@ -132,6 +132,20 @@ const assert = (c, m) => { if (!c) throw new Error("ASSERT: " + m); };
   );
   await waitCrumb("cwd-sub");
 
+  // 深层、之前没加载过的目录：异步加载完成后也必须选中并贴顶。
+  const deepDir = path.join(ROOT, "deep", "a", "b", "c");
+  fs.mkdirSync(deepDir, { recursive: true });
+  await page.locator(".pane-term").click();
+  await page.keyboard.type(`cd '${deepDir}'\r`);
+  await waitCrumb("c");
+  await waitFor("deep cwd selected at top", () => {
+    const list = document.querySelector("#file-list");
+    const sel = list.querySelector(".entry.selected");
+    if (!sel) return false;
+    const gap = sel.getBoundingClientRect().top - list.getBoundingClientRect().top;
+    return list.scrollTop > 0 && gap >= -1 && gap <= 12;
+  });
+
   assert(errors.length === 0, "console errors: " + errors.join(" | "));
   console.log("cwd: PASS");
   await browser.close();
