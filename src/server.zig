@@ -481,7 +481,8 @@ fn handleHttp(
             connSetDeadline(io, fd, 600);
             defer connClearDeadline(io, fd);
             if (request.head.method == .PUT and util.requestHasBody(request)) {
-                const bytes: i96 = @intCast(request.head.content_length orelse 0);
+                // chunked 上传没有 Content-Length；按 64 MiB 上限给时间，不能按 0 算。
+                const bytes: i96 = if (request.head.content_length) |n| @intCast(n) else 64 * 1024 * 1024;
                 const seconds = @min(@as(i96, 3600), 120 + @divTrunc(bytes, 32 * 1024));
                 connSetDeadline(io, fd, seconds);
             }

@@ -54,7 +54,6 @@ pub const Attachment = struct {
     out_cond: Io.Condition = .init,
     out_queue: std.ArrayList(Frame) = .empty,
     out_bytes: usize = 0,
-    out_inflight: bool = false,
     out_closed: bool = false,
     writer: ?std.Thread = null,
 
@@ -121,15 +120,11 @@ pub const Attachment = struct {
             }
             const frame = self.out_queue.orderedRemove(0);
             self.out_bytes -= frame.data.len;
-            self.out_inflight = true;
             self.out_mutex.unlock(self.io);
 
             self.send_mutex.lockUncancelable(self.io);
             self.ws.writeMessage(frame.data, frame.op) catch {
                 self.send_mutex.unlock(self.io);
-                self.out_mutex.lockUncancelable(self.io);
-                self.out_inflight = false;
-                self.out_mutex.unlock(self.io);
                 self.alive.store(false, .release);
                 self.stream.shutdown(self.io, .both) catch {};
                 self.gpa.free(frame.data);
@@ -138,26 +133,10 @@ pub const Attachment = struct {
             self.send_mutex.unlock(self.io);
             const closing = frame.op == .connection_close;
             self.gpa.free(frame.data);
-            self.out_mutex.lockUncancelable(self.io);
-            self.out_inflight = false;
-            self.out_mutex.unlock(self.io);
             if (closing) {
                 self.stream.shutdown(self.io, .both) catch {};
                 return;
             }
-        }
-    }
-
-    /// 等旧前端的关闭帧发出去，最多 200ms；超时后由调用方直接 shutdown。
-    fn waitOutEmpty(self: *Attachment, timeout_ms: u32) void {
-        var waited: u32 = 0;
-        while (waited < timeout_ms) {
-            self.out_mutex.lockUncancelable(self.io);
-            const empty = self.out_queue.items.len == 0 and !self.out_inflight;
-            self.out_mutex.unlock(self.io);
-            if (empty) return;
-            Io.sleep(self.io, Io.Duration.fromMilliseconds(2), .real) catch return;
-            waited += 2;
         }
     }
 };
@@ -168,19 +147,19 @@ pub const Attachment = struct {
 /// 否则两个页面会互相把对方踢下线，来回争抢同一个 shell。
 const taken_over_close = [2]u8{ 0x0F, 0xA1 }; // 4001
 
-fn sendTakenOver(att: *Attachment) void {
-    // 写线程空闲时直接发 4001：关闭帧必须让浏览器看到 4001，否则旧页面
-    // 会把它当成异常断开并自动重连，形成两个窗口互相抢会话。
-    if (att.send_mutex.tryLock()) {
-        defer att.send_mutex.unlock(att.io);
-        att.ws.writeMessage(&taken_over_close, .connection_close) catch {};
-        return;
-    }
-    // 写线程正在发大块输出：清队列，把关闭帧排到最前面，最多等 200ms。
+fn sendTakenOver(att: *Attachment) bool {
+    // 只入队，不在这里写 socket：attach 持有 manager/session 锁，任何阻塞写
+    // 都会把整个接管路径卡死。写线程空闲时会发出 4001；如果它正卡在慢客户端
+    // 的写操作里，sweep 会在 2 秒后强制关闭连接，旧页面最多按 1006 处理。
     att.dropQueued();
-    att.sendRaw(&taken_over_close, .connection_close) catch return;
-    att.waitOutEmpty(200);
+    att.sendRaw(&taken_over_close, .connection_close) catch return false;
+    return true;
 }
+
+const Retired = struct {
+    att: *Attachment,
+    deadline_ns: i96,
+};
 
 pub const Manager = struct {
     io: Io,
@@ -188,6 +167,10 @@ pub const Manager = struct {
     cfg: *const config.Config,
     mutex: Io.Mutex = .init,
     sessions: std.ArrayList(*Session) = .empty,
+    /// 被接管、但还没 detach 的旧前端。写线程如果卡住，由 sweep 在 2 秒后
+    /// 直接 shutdown，避免旧连接永久占着 socket，也保证 attach 不必等它。
+    retire_mutex: Io.Mutex = .init,
+    retiring: std.ArrayList(Retired) = .empty,
     /// 当前还挂着的 WebSocket 前端数量；退出时用来判断是否可以安全释放会话。
     live_attachments: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     pub fn init(io: Io, gpa: Allocator, cfg: *const config.Config) Manager {
@@ -196,7 +179,46 @@ pub const Manager = struct {
 
     /// 只释放列表本身；会话应当在 shutdown() 里清理干净。
     pub fn deinit(self: *Manager) void {
+        self.retiring.deinit(self.gpa);
         self.sessions.deinit(self.gpa);
+    }
+
+    fn retire(self: *Manager, att: *Attachment) void {
+        self.retire_mutex.lockUncancelable(self.io);
+        defer self.retire_mutex.unlock(self.io);
+        self.retiring.append(self.gpa, .{
+            .att = att,
+            .deadline_ns = self.now() + 2 * std.time.ns_per_s,
+        }) catch {
+            att.stream.shutdown(self.io, .both) catch {};
+        };
+    }
+
+    fn unretire(self: *Manager, att: *Attachment) void {
+        self.retire_mutex.lockUncancelable(self.io);
+        defer self.retire_mutex.unlock(self.io);
+        var i: usize = 0;
+        while (i < self.retiring.items.len) : (i += 1) {
+            if (self.retiring.items[i].att == att) {
+                _ = self.retiring.swapRemove(i);
+                return;
+            }
+        }
+    }
+
+    fn sweepRetiring(self: *Manager, ts: i96) void {
+        self.retire_mutex.lockUncancelable(self.io);
+        defer self.retire_mutex.unlock(self.io);
+        var i: usize = 0;
+        while (i < self.retiring.items.len) {
+            const r = self.retiring.items[i];
+            if (ts < r.deadline_ns) {
+                i += 1;
+                continue;
+            }
+            _ = self.retiring.swapRemove(i);
+            r.att.stream.shutdown(self.io, .both) catch {};
+        }
     }
 
     fn now(self: *Manager) i96 {
@@ -246,9 +268,14 @@ pub const Manager = struct {
         // 同一个会话被另一个前端接管时，先踢掉旧的。旧 Attachment 仍算一个
         // ref，必须等它自己 detach 后才能释放 Session。
         if (session.attachment) |old| {
-            old.alive.store(false, .release);
-            sendTakenOver(old);
-            old.stream.shutdown(self.io, .both) catch {};
+            // 先入队 close：sendRaw 会检查 alive，不能先置 false。
+            if (sendTakenOver(old)) {
+                old.alive.store(false, .release);
+                self.retire(old);
+            } else {
+                old.alive.store(false, .release);
+                old.stream.shutdown(self.io, .both) catch {};
+            }
             session.attachment = null;
         }
 
@@ -300,10 +327,15 @@ pub const Manager = struct {
     }
 
     pub fn detach(self: *Manager, att: *Attachment) void {
-        const session = att.session orelse return;
-        att.session = null;
-
+        const session = att.session orelse {
+            self.unretire(att);
+            return;
+        };
+        // 必须先拿 session 锁再 unretire：attach 在持有同一把锁时把旧前端加入
+        // retiring。否则 detach 可能先查不到条目、attach 随后又加入，留下悬空指针。
         session.mutex.lockUncancelable(self.io);
+        self.unretire(att);
+        att.session = null;
         if (session.attachment == att) session.attachment = null;
         session.last_activity_ns = self.now();
         if (session.attachments > 0) session.attachments -= 1;
@@ -362,6 +394,7 @@ pub const Manager = struct {
         defer self.mutex.unlock(self.io);
 
         const ts = self.now();
+        self.sweepRetiring(ts);
         const idle_minutes = self.cfg.pty_idle_minutes;
         const idle_ns: i96 = @as(i96, @intCast(idle_minutes)) * 60 * @as(i96, std.time.ns_per_s);
 

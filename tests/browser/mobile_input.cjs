@@ -1,5 +1,7 @@
 // 手机软键盘输入只发一次：覆盖 keyup 早于 input、input 非 composed 等顺序。
 const { chromium } = require("playwright");
+const fs = require("fs");
+const path = require("path");
 
 const BASE = process.env.BASE;
 const PASSWORD = process.env.PASSWORD;
@@ -152,6 +154,21 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   });
   const enter = await drain();
   assert(enter.join("") === "\n", `enter: expected one newline, got ${JSON.stringify(enter)}`);
+
+  // 编辑标签激活时，触屏设备上那条失效的 Esc/Tab/Ctrl 按键条必须真正隐藏。
+  await page.locator(".pane-term").first().click();
+  await page.keyboard.type("printf 'x\\n' > mobile-edit.txt\r");
+  for (let i = 0; i < 50 && !fs.existsSync(path.join(process.env.ROOT, "mobile-edit.txt")); i++) await sleep(100);
+  await page.click("#toggle-files");
+  await page.click("#files-refresh");
+  const mobileFile = page.locator("#file-list .entry.file", { hasText: "mobile-edit.txt" });
+  await mobileFile.locator(".name").click();
+  await page.waitForSelector(".tab-workspace:not([hidden]) .editor-text");
+  const keys = await page.evaluate(() => {
+    const el = document.querySelector("#keys");
+    return { hidden: el.hidden, display: getComputedStyle(el).display };
+  });
+  assert(keys.hidden && keys.display === "none", "keys bar hidden for editor: " + JSON.stringify(keys));
 
   assert(errors.length === 0, "page errors: " + errors.join(" | "));
   await browser.close();

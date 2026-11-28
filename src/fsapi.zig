@@ -11,6 +11,8 @@ const http = std.http;
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
+const linux = std.os.linux;
+const posix = std.posix;
 const util = @import("util.zig");
 
 pub const max_read: usize = 1024 * 1024;
@@ -209,14 +211,19 @@ fn write(io: Io, gpa: Allocator, arena: Allocator, request: *http.Server.Request
     const base_ok = baseMatches(io, arena, abs, base) catch |err| return failMapped(request, arena, err);
     if (!base_ok) return fail(request, arena, .conflict, "modified_on_disk");
 
-    const perms = existingFilePermissions(io, abs) orelse .default_file;
+    const meta = if (exclusive) null else existingMeta(io, arena, abs) catch |err| switch (err) {
+        error.MetadataUnsafe => return fail(request, arena, .conflict, "metadata_unsafe"),
+        else => return failMapped(request, arena, err),
+    };
+    const perms = if (meta) |m| std.Io.File.Permissions.fromMode(m.mode) else .default_file;
     var atomic = Dir.cwd().createFileAtomic(io, abs, .{
         .replace = !exclusive,
         .permissions = perms,
     }) catch |err| return failMapped(request, arena, err);
     defer atomic.deinit(io);
-    atomic.file.setPermissions(io, perms) catch {};
     atomic.file.writeStreamingAll(io, body) catch |err| return failMapped(request, arena, err);
+    if (meta) |m| applyMeta(io, atomic.file, m) catch
+        return fail(request, arena, .conflict, "metadata_unsafe");
     if (exclusive) {
         atomic.link(io) catch |err| return failMapped(request, arena, err);
     } else {
@@ -319,15 +326,16 @@ fn uploadSingle(io: Io, arena: Allocator, rel: []const u8, request: *http.Server
     }
 
     const abs = resolveWriteTarget(io, arena, rel) catch |err| return failMapped(request, arena, err);
-
-    const existing_perms = existingFilePermissions(io, abs);
-    const perms = existing_perms orelse .default_file;
+    const meta = existingMeta(io, arena, abs) catch |err| switch (err) {
+        error.MetadataUnsafe => return fail(request, arena, .conflict, "metadata_unsafe"),
+        else => return failMapped(request, arena, err),
+    };
+    const perms = if (meta) |m| std.Io.File.Permissions.fromMode(m.mode) else .default_file;
     var atomic = Dir.cwd().createFileAtomic(io, abs, .{
         .replace = true,
         .permissions = perms,
     }) catch |err| return failMapped(request, arena, err);
     defer atomic.deinit(io);
-    if (existing_perms != null) atomic.file.setPermissions(io, perms) catch {};
 
     var head_buf: [16 * 1024]u8 = undefined;
     const body_reader = request.readerExpectContinue(&head_buf) catch
@@ -344,6 +352,8 @@ fn uploadSingle(io: Io, arena: Allocator, rel: []const u8, request: *http.Server
     }
 
     if (!util.bodyComplete(request)) return failClose(request, arena, .bad_request, "bad_body");
+    if (meta) |m| applyMeta(io, atomic.file, m) catch
+        return fail(request, arena, .conflict, "metadata_unsafe");
     atomic.replace(io) catch |err| return failMapped(request, arena, err);
 
     var pb: [256]u8 = undefined;
@@ -582,13 +592,6 @@ fn joinAbs(alloc: Allocator, root: []const u8, rel: []const u8) ![]const u8 {
     return std.fmt.allocPrint(alloc, "{s}/{s}", .{ root, rel });
 }
 
-/// 保留被覆盖文件的权限位；目标不存在/是符号链接时返回 null，交给默认 umask/模式。
-fn existingFilePermissions(io: Io, abs: []const u8) ?std.Io.File.Permissions {
-    const st = Dir.cwd().statFile(io, abs, .{ .follow_symlinks = false }) catch return null;
-    if (st.kind == .file) return st.permissions;
-    return null;
-}
-
 /// 解析已存在的目标；realpath 用于消除符号链接，便于后续按文件/目录处理。
 fn resolveExisting(io: Io, alloc: Allocator, rel: []const u8) PathError![:0]u8 {
     const joined = joinAbs(alloc, "/", rel) catch return error.OutOfMemory;
@@ -620,6 +623,98 @@ fn resolveWriteTarget(io: Io, alloc: Allocator, rel: []const u8) PathError![]con
         error.FileNotFound => resolveNew(io, alloc, rel),
         else => err,
     };
+}
+
+const Xattr = struct {
+    name: [:0]const u8,
+    value: []const u8,
+};
+
+const FileMeta = struct {
+    uid: linux.uid_t,
+    gid: linux.gid_t,
+    mode: posix.mode_t,
+    xattrs: []const Xattr,
+};
+
+/// 原子替换会换 inode。能在新 inode 上重建的属性就重建；重建不了的
+/// （硬链接、无法 chown 的属主）直接拒绝，避免静默改坏文件。
+fn existingMeta(io: Io, alloc: Allocator, abs: []const u8) !?FileMeta {
+    var file = Dir.cwd().openFile(io, abs, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer file.close(io);
+
+    var stx: linux.Statx = undefined;
+    const rc = linux.statx(file.handle, "", linux.AT.EMPTY_PATH, .{
+        .MODE = true,
+        .NLINK = true,
+        .UID = true,
+        .GID = true,
+    }, &stx);
+    if (posix.errno(rc) != .SUCCESS) return error.MetadataUnsafe;
+    if (stx.nlink > 1 or stx.uid != linux.geteuid()) return error.MetadataUnsafe;
+
+    return .{
+        .uid = stx.uid,
+        .gid = stx.gid,
+        .mode = stx.mode & 0o7777,
+        .xattrs = try readXattrs(alloc, file),
+    };
+}
+
+/// 替换 inode 后需要手动恢复的扩展属性：POSIX ACL、文件 capability 和
+/// 用户自定义属性。SELinux 标签由内核按新文件所在目录重新计算，IMA/EVM
+/// 签名在内容变化后本来就会失效，因此都不复制。
+fn shouldPreserveXattr(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, "user.") or
+        std.mem.startsWith(u8, name, "system.posix_acl_") or
+        std.mem.eql(u8, name, "security.capability");
+}
+
+fn readXattrs(alloc: Allocator, file: std.Io.File) ![]const Xattr {
+    var empty: [0]u8 = .{};
+    const list_len = linux.flistxattr(file.handle, &empty, 0);
+    switch (posix.errno(list_len)) {
+        .SUCCESS => {},
+        .OPNOTSUPP => return &.{}, // 文件系统不支持 xattr
+        else => return error.MetadataUnsafe,
+    }
+
+    const names = try alloc.alloc(u8, list_len);
+    const n = linux.flistxattr(file.handle, names.ptr, names.len);
+    if (posix.errno(n) != .SUCCESS or n > names.len) return error.MetadataUnsafe;
+
+    var out: std.ArrayList(Xattr) = .empty;
+    var at: usize = 0;
+    while (at < n) {
+        const end = std.mem.indexOfScalar(u8, names[at..n], 0) orelse
+            return error.MetadataUnsafe;
+        const name: [:0]u8 = names[at .. at + end :0];
+        at += end + 1;
+        if (!shouldPreserveXattr(name)) continue;
+        const value_len = linux.fgetxattr(file.handle, name.ptr, &empty, 0);
+        if (posix.errno(value_len) == .NODATA) continue;
+        if (posix.errno(value_len) != .SUCCESS) return error.MetadataUnsafe;
+        const value = try alloc.alloc(u8, value_len);
+        const got = linux.fgetxattr(file.handle, name.ptr, value.ptr, value.len);
+        if (posix.errno(got) != .SUCCESS or got != value_len)
+            return error.MetadataUnsafe;
+        try out.append(alloc, .{ .name = name, .value = value });
+    }
+    return out.items;
+}
+
+fn applyMeta(io: Io, file: std.Io.File, meta: FileMeta) !void {
+    if (posix.errno(linux.fchown(file.handle, meta.uid, meta.gid)) != .SUCCESS)
+        return error.MetadataUnsafe;
+    for (meta.xattrs) |xattr| {
+        if (posix.errno(linux.fsetxattr(file.handle, xattr.name.ptr, xattr.value.ptr, xattr.value.len, 0)) != .SUCCESS)
+            return error.MetadataUnsafe;
+    }
+    file.setPermissions(io, std.Io.File.Permissions.fromMode(meta.mode)) catch
+        return error.MetadataUnsafe;
 }
 
 /// 只规范化父目录，不解析最后一段。delete/rename 用它来操作符号链接本身，

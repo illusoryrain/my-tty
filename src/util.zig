@@ -5,20 +5,25 @@ const std = @import("std");
 const http = std.http;
 const flate = std.compress.flate;
 
+/// gzip 压缩器约 224 KiB，每次响应都新建/清零没有意义。这里只保留一份，
+/// 用互斥锁串行使用；压缩本身是 CPU 密集的，并发请求串行不会成为瓶颈。
+var gzip_lock: std.atomic.Mutex = .unlocked;
+var gzip_window: [flate.max_window_len]u8 = undefined;
+var gzip_comp: flate.Compress = undefined;
+
 /// 用 gzip 容器压缩一段资源。调用方负责释放返回值。
-///
-/// 只用于启动时预压缩内嵌的前端文件；`Compress` 自身约 224 KiB，刻意
-/// `noinline`，避免把这帧并进调用者（尤其是 main）的栈帧。
+/// `noinline` 避免把压缩器的初始化/调用帧并进 main 的栈。
 pub noinline fn gzipAlloc(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
     var out = try std.Io.Writer.Allocating.initCapacity(alloc, 64);
     errdefer out.deinit();
-    const window = try alloc.alloc(u8, flate.max_window_len);
-    defer alloc.free(window);
-    const comp = try alloc.create(flate.Compress);
-    defer alloc.destroy(comp);
-    comp.* = try flate.Compress.init(&out.writer, window, .gzip, .default);
-    try comp.writer.writeAll(input);
-    try comp.finish();
+
+    // util.zig 不持有 Io，无法用 Io.Mutex 的 futex 等待；压缩是短临界区，
+    // 让出 CPU 比原地自旋更合适。
+    while (!gzip_lock.tryLock()) std.Thread.yield() catch {};
+    defer gzip_lock.unlock();
+    gzip_comp = try flate.Compress.init(&out.writer, &gzip_window, .gzip, .default);
+    try gzip_comp.writer.writeAll(input);
+    try gzip_comp.finish();
     return out.toOwnedSlice();
 }
 

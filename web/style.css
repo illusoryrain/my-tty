@@ -1223,6 +1223,10 @@ button.icon {
   border-top: 1px solid var(--line);
 }
 
+#keys[hidden] {
+  display: none;
+}
+
 #keys button {
   flex: 0 0 auto;
   min-width: 36px;

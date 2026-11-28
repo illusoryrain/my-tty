@@ -75,6 +75,10 @@ const assert = (c, m) => { if (!c) throw new Error("ASSERT: " + m); };
   await page.keyboard.press("Escape");
   await page.waitForSelector("#prompt-overlay", { state: "hidden" });
   assert(await page.isVisible(editor), "editor tab still open after cancel");
+  assert(
+    await page.evaluate(() => document.activeElement === document.querySelector(".tab-workspace:not([hidden]) .editor-text")),
+    "focus returns to editor after cancel"
+  );
   await page.locator(".tab.active .tab-close").click();
   await page.waitForSelector("#prompt-overlay:not([hidden])");
   await page.click("#prompt-ok");

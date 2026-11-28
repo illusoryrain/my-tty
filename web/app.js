@@ -350,7 +350,10 @@
     if (tab.kind === "terminal") {
       if (cwdSyncEnabled && activePane && activePane.cwd) syncFilesToCwd(activePane.cwd);
       requestAnimationFrame(() => {
-        for (const p of tab.panes) fitPane(p);
+        for (const p of tab.panes) {
+          fitPane(p);
+          flushOutput(p);
+        }
         if (activePane && !coarsePointer) activePane.term.focus();
       });
     } else if (tab.editor) {
@@ -374,6 +377,8 @@
       );
       if (!ok) {
         tab.closing = false;
+        if (tab === activeTab && tab.editor) tab.editor.textarea.focus();
+        else focusActive();
         return;
       }
     }
@@ -634,6 +639,7 @@
       // 终端输出写队列：xterm 还在解析上一批时到达的帧先攒起来，下一批合成一次 write。
       outQueue: [],
       outQueued: 0,
+      dropping: false,
       outWriting: false,
     };
     tab.panes.push(pane);
@@ -777,6 +783,7 @@
       if (pane.ws !== ws) return;
       pane.alive = true;
       pane.authStopped = false;
+      pane.dropping = false;
       pane.opens += 1;
       pane.retryAttempt = 0;
       pane.retryable = true;
@@ -793,6 +800,9 @@
       if (pane.ws !== ws) return;
       pane.lastRx = Date.now();
       if (typeof event.data !== "string") {
+        // 已经决定丢弃队列并重连时，后续帧不能再计入 offset，
+        // 否则服务端回放会从错误的位置开始，丢掉的字节就补不回来了。
+        if (pane.dropping) return;
         const bytes = new Uint8Array(event.data);
         pane.offset += bytes.byteLength;
         queueOutput(pane, bytes);
@@ -881,19 +891,39 @@
   // 刷屏（cat 大文件、编译日志）时服务端每次 PTY 读取就是一帧；逐帧 term.write
   // 会让 xterm 排起成千上万个小任务。这里同一时间只让一批在 xterm 里解析，
   // 期间到达的帧在完成回调里合并成一次 write。顺序不变，也不丢字节。
-  function queueOutput(pane, bytes) {
-    pane.outQueue.push(bytes);
-    pane.outQueued += bytes.byteLength;
-    if (!pane.outWriting) flushOutput(pane);
-  }
-
   // 单次 write 的上限：刷屏时待写帧可能很多，按块合并，避免一次分配几 MB
   // 的连续缓冲；xterm 内部仍会按自己的节奏解析。
   const MAX_WRITE_BATCH = 256 * 1024;
+  // 后台标签不解析输出；队列超过这个量就断开重连，靠服务端环形缓冲回放，
+  // 避免低端设备被一条刷屏命令拖到 OOM。
+  const MAX_OUT_QUEUE = 8 * 1024 * 1024;
+
+  function queueOutput(pane, bytes) {
+    if (pane.outQueued + bytes.byteLength > MAX_OUT_QUEUE) {
+      // offset 已经在 onmessage 里按收到顺序前进；把还没交给 xterm 的部分退回去，
+      // 重连后从服务端环形缓冲重新回放。正在 write 的那一块不计入 outQueued，
+      // 它会正常显示，所以也不能退回。
+      pane.offset = Math.max(0, pane.offset - pane.outQueued - bytes.byteLength);
+      pane.outQueue = [];
+      pane.outQueued = 0;
+      pane.dropping = true;
+      setPaneStatus(pane, "输出过快，正在重连", "pending");
+      try {
+        pane.ws?.close();
+      } catch (_) {}
+      return;
+    }
+    pane.outQueue.push(bytes);
+    pane.outQueued += bytes.byteLength;
+    if (pane.tab === activeTab && !document.hidden && !pane.outWriting) flushOutput(pane);
+  }
 
   function flushOutput(pane) {
+    // 同一时刻只允许一个 write 在 xterm 里排队；完成回调会再触发下一批。
+    // 切标签/回到前台时可以直接调用，不必关心是否已有 write 在途。
+    if (pane.outWriting) return;
+    if (pane.tab !== activeTab || document.hidden) return;
     if (pane.outQueue.length === 0 || !pane.el.isConnected) {
-      pane.outWriting = false;
       pane.outQueue = [];
       pane.outQueued = 0;
       return;
@@ -920,7 +950,10 @@
     pane.outQueue.splice(0, take);
     pane.outQueued -= bytes;
     pane.outWriting = true;
-    pane.term.write(chunk, () => flushOutput(pane));
+    pane.term.write(chunk, () => {
+      pane.outWriting = false;
+      flushOutput(pane);
+    });
   }
 
   // 半开连接（手机锁屏、掉 Wi-Fi、笔记本睡眠）不会触发 onclose，只能靠心跳发现。
@@ -1527,6 +1560,16 @@
       treeDirty = true;
     }
     treeChildren.set(path, result);
+    // 只缓存最近浏览的目录，避免长时间使用后无限增长；展开中的目录保留，
+    // 否则树里会出现“状态还在展开、子节点却没了”的空洞。
+    if (treeChildren.size > 256) {
+      for (const key of treeChildren.keys()) {
+        if (key !== "" && key !== path && !treeExpanded.has(key)) {
+          treeChildren.delete(key);
+          break;
+        }
+      }
+    }
     return result;
   }
 
@@ -1891,13 +1934,6 @@
     { passive: true }
   );
 
-  window.addEventListener("resize", () => {
-    rowHeightCache = 0;
-    windowStart = -1;
-    windowEnd = -1;
-    renderWindow(true);
-  });
-
   const actionIcons = {
     download: ["M8 2.5v8", "M4.5 7 8 10.5 11.5 7", "M3.5 13h9"],
     rename: ["M3 13l1-3 7-7 2 2-7 7z", "M9.5 3.5l2 2"],
@@ -1963,15 +1999,19 @@
 
   async function deleteEntry(path, name, isDir) {
     if (!(await askConfirm(`删除 ${name}？`, "此操作不可撤销。", "删除", true))) return;
+    // 先处理受影响的编辑器；用户只要保留一个未保存标签，就放弃删除，
+    // 避免标签在删除后还指向一个已经不存在的路径。
+    for (const tab of [...tabs]) {
+      if (tab.kind !== "editor" || !tab.editor) continue;
+      const p = tab.editor.path;
+      if (p !== path && !(isDir && p.startsWith(`${path}/`))) continue;
+      await closeTab(tab);
+      if (tabs.includes(tab)) return;
+    }
     const parentPath = parentOf(path);
     try {
       await api("DELETE", "delete", { path });
       if (isDir) dropTreePath(path);
-      for (const tab of [...tabs]) {
-        if (tab.kind !== "editor" || !tab.editor) continue;
-        const p = tab.editor.path;
-        if (p === path || (isDir && p.startsWith(`${path}/`))) await closeTab(tab);
-      }
       refreshFiles([parentPath]);
     } catch (err) {
       notice(`删除失败: ${err.message}`, true);
@@ -2442,6 +2482,11 @@
       refreshFiles([parentOf(ed.path)]);
     } catch (err) {
       if (tab.editor !== ed || !tabs.includes(tab)) return;
+      if (err.code === "metadata_unsafe") {
+        setEditorState(tab, "文件元数据无法安全保留");
+        notice("该文件有硬链接，或属主/扩展属性无法保留，编辑器不能安全覆盖", true);
+        return;
+      }
       if (err.code === "modified_on_disk") {
         setEditorState(tab, "文件已在别处被修改");
         retryForce = await askConfirm(
@@ -2469,6 +2514,20 @@
   }
 
   // -------------------------------------------------------------------- boot
+
+  let resizeFrame = 0;
+  window.addEventListener("resize", () => {
+    if (resizeFrame) return;
+    resizeFrame = requestAnimationFrame(() => {
+      resizeFrame = 0;
+      rowHeightCache = 0;
+      windowStart = -1;
+      windowEnd = -1;
+      if (!filesEl.hidden) renderWindow(true);
+      setFilesWidth(filesWidth);
+      layoutTabs();
+    });
+  });
 
   addPaneBtn.addEventListener("click", () => {
     if (!activeTab || activeTab.kind !== "terminal") return;
@@ -2618,12 +2677,7 @@
   });
   ro.observe(workspace);
 
-  // 终端尺寸统一交给上面的 ResizeObserver（已按帧合并）；这里再 fit 一遍
-  // 只会让每次窗口拖动多做一轮强制同步布局。
-  window.addEventListener("resize", () => {
-    setFilesWidth(filesWidth);
-    layoutTabs();
-  });
+  // 窗口尺寸统一在 boot 里的一个 rAF 处理器中处理，避免拖动时重复布局。
   if (document.fonts && document.fonts.ready) {
     document.fonts.ready.then(() => {
       panes.forEach(fitPane);
@@ -2632,7 +2686,10 @@
   }
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) {
-      panes.forEach(fitPane);
+      panes.forEach((p) => {
+        fitPane(p);
+        flushOutput(p);
+      });
       // 后台时心跳暂停；回到前台先确认连接还活着，半开的连接会被心跳关掉重连。
       for (const tab of tabs) {
         for (const pane of tab.panes) {

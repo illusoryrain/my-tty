@@ -146,6 +146,15 @@ code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST -b "$COOKIE_JAR" \
 [ -f "$ROOT/a.txt" ]
 pass "rename does not overwrite existing target"
 
+printf 'old' >"$ROOT/hard.txt"
+ln "$ROOT/hard.txt" "$ROOT/hard-link.txt"
+code=$(curl -sS -o /dev/null -w '%{http_code}' -X PUT -b "$COOKIE_JAR" --data-binary 'new' \
+  "$API/write?path=$REL/hard.txt")
+[ "$code" = "409" ]
+[ "$(cat "$ROOT/hard.txt")" = "old" ]
+pass "hardlinked file is not atomically replaced"
+rm -f "$ROOT/hard-link.txt"
+
 # 长路径 + 大于 1 KiB 的写响应：body 读完后不能再碰 header。
 LONG=$(printf 'd%.0s' $(seq 1 240))
 LONGPATH="$REL/$LONG/$LONG/$LONG/$LONG"
