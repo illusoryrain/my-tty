@@ -7,10 +7,6 @@ const pty = @import("../pty.zig");
 const Manager = session.Manager;
 const Attachment = session.Attachment;
 
-// ---------------------------------------------------------------------------
-// WebSocket 前端
-// ---------------------------------------------------------------------------
-
 pub const Control = struct {
     t: []const u8 = "",
     cols: ?u16 = null,

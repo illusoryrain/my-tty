@@ -1,4 +1,3 @@
-  // ------------------------------------------------------------------- editor
 
   function baseName(path) {
     const i = path.lastIndexOf("/");

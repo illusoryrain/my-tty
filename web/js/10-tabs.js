@@ -1,4 +1,3 @@
-  // ---------------------------------------------------------------- tabs
 
   function updateTabHint() {
     tabAddBtn.disabled = tabs.length >= MAX_TABS;

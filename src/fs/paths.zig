@@ -33,10 +33,6 @@ pub fn contentDisposition(buf: []u8, name: []const u8) []const u8 {
     return w.buffered();
 }
 
-// ---------------------------------------------------------------------------
-// 路径处理与响应
-// ---------------------------------------------------------------------------
-
 const PathError = error{
     InvalidPath,
     FileNotFound,

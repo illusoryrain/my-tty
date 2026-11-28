@@ -1,4 +1,3 @@
-  // -------------------------------------------------------------------- boot
 
   let resizeFrame = 0;
   window.addEventListener("resize", () => {

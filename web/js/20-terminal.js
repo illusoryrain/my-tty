@@ -1,4 +1,3 @@
-  // ---------------------------------------------------------------- terminals
 
   function createPane(initialSession = "", tab = activeTab) {
     if (!tab || tab.panes.length >= MAX_PANES) return;

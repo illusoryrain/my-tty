@@ -1,4 +1,3 @@
-  // --------------------------------------------------------- 剪贴板兜底
 
   function copyText(text) {
     if (!text) return Promise.resolve();

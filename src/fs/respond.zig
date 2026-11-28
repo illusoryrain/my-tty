@@ -112,5 +112,3 @@ pub fn failMapped(request: *http.Server.Request, alloc: Allocator, err: anyerror
         else => fail(request, alloc, .internal_server_error, "io_error"),
     };
 }
-
-// ---------------------------------------------------------------------------

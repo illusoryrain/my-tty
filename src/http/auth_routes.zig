@@ -118,10 +118,6 @@ pub fn handleStatus(request: *http.Server.Request) !void {
     return respond.respond(request, "{\"authenticated\":true}", .ok);
 }
 
-// ---------------------------------------------------------------------------
-// 小工具
-// ---------------------------------------------------------------------------
-
 pub fn authorized(auth_state: *auth.Auth, request: *const http.Server.Request) bool {
     const cookie = auth.cookieFromRequest(request) orelse return false;
     return auth_state.validate(cookie);

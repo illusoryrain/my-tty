@@ -339,8 +339,6 @@ pub fn setCookieValue(buf: []u8, value: ?[]const u8, max_age_seconds: i64, secur
     return std.fmt.bufPrint(buf, "{s}=; Max-Age=0{s}", .{ cookie_name, tail }) catch "";
 }
 
-// ---------------------------------------------------------------------------
-
 test "cookie header parsing" {
     try std.testing.expectEqualStrings(
         "abc123",
