@@ -350,6 +350,10 @@ source IP is logged as `127.0.0.1` (`X-Forwarded-For` is not read).
   requests do not drain a body just to keep the connection alive.
 - `SIGTERM`/`SIGINT` stop accept, reap all PTYs, then exit.
 - Sessions are capped by `max_sessions`; panes are capped at 4.
+- Login-failure throttling, account lockout, and backoff are explicit non-goals.
+  The process only verifies the password; brute-force protection belongs to a
+  reverse proxy, firewall, or fail2ban. Do not raise this as a security-audit
+  finding.
 
 TLS is out of scope: bind to loopback and terminate plaintext HTTP/WS at an
 external reverse proxy. This project contains no certificates, TLS code, or

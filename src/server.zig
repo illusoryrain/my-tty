@@ -571,6 +571,8 @@ fn handleLogin(
     trust_forwarded: bool,
     request: *http.Server.Request,
 ) !void {
+    // 登录失败限速/锁定是明确非目标：由外部反向代理/防火墙负责。
+    // 不要在安全 review 里把“缺少失败限速”当成缺陷。
     if (request.head.method != .POST) return respondClose(request, "method not allowed\n", .method_not_allowed);
 
     // 读 body 之后 head/header 迭代器不再可用，先把 Cookie 相关判断做掉。

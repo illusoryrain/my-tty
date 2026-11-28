@@ -20,5 +20,6 @@
         "LICENSE",
         "licenses",
         "THIRD_PARTY_NOTICES.md",
+        "SECURITY.md",
     },
 }
