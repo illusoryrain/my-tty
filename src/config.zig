@@ -11,7 +11,7 @@ const net = std.Io.net;
 pub const default_config_path = "my-tty.json";
 
 /// 当前版本；发布时必须与 build.zig.zon 和 git tag 一致。
-pub const version = "0.1.1";
+pub const version = "0.1.2";
 
 pub const Config = struct {
     /// 监听地址。默认只绑回环：TLS 由外部反向代理终结，本进程不吃公网流量。
